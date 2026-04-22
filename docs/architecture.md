@@ -1,8 +1,65 @@
 # Smart AI TD Operations — Architecture Plan
 
-**Version:** 1.0 — Draft for multi-session challenge review
-**Date:** 2026-04-21
-**Status:** Pre-build. Signed-off decisions (D1-D9) locked. Plan open for structured challenge before Stage 0 begins.
+**Version:** 1.1 — Post-Round 2 adversarial review
+**Date:** 2026-04-22 (v1.1 revision); 2026-04-21 (v1.0)
+**Status:** Pre-build. Signed-off decisions (D1-D9) locked with named kill criteria. Plan revised against Rounds 1 and 2; open for Round 3 structured challenge before Stage 0 begins.
+
+## v1.1 Changelog — What Changed Since v1.0
+
+### Round 1 (Round-1 reviewer-raised): 12 fixes accepted, revised, and re-evaluated
+
+| Item | v1.0 | v1.1 |
+|---|---|---|
+| Solver purity | Claimed "pure function, no DB writes" | **Idempotent, event-driven, may queue side effects with dedup key** |
+| emit() transaction size | Best-behavior guidance only | **Hard 5-write/200ms ceiling; overflow MUST decompose into Inngest steps** |
+| idempotency_key | Optional, STRONGLY RECOMMENDED | **REQUIRED for actor_type IN ('webhook','cron','agent'), typed factories with namespace prefixes** |
+| Cross-engagement cache invalidation | Subject_id-keyed; theoretical leak | **Spec DSL declares dependencies; invalidator walks graph transitively with depth-5 limit** |
+| PII scrubbing | Post-hoc scheduled pass | **Structural: template-slot pattern in agent output; no free-form PII in event payloads** |
+| Compound per-account state | Render-time composition | **`account_case` projection table with field-level source-of-truth rules** |
+| 90/10 rule split | Asserted | **Empirical measurement in Stage 0 S0.0.5 with kill criteria on spec engine if ratio is wrong** |
+| Calibration tempo | Weekly batch | **Bayesian sequential test; alerts within hours regardless of sample volume** |
+| Shadow mode validation | Webhook-only | **Live pilot cohort added pre-cutover with per-client routing infrastructure** |
+| Kill criteria | Mentioned | **Named numeric thresholds per D1-D9 (Appendix A)** |
+| Hot-path handling | Everything through Inngest | **Direct handlers for hot paths (state+outbox atomic); Inngest reads outbox for side effects** |
+| SLOs | Aspirational targets | **v1 baselines measured in Stage 0; SLOs = baseline ± 10% with vendor-p95 slack** |
+
+### Round 2 (new reviewer, architecture-only): 3 load-bearing flaws + 5 significant + 7 minor
+
+| Flaw | Consequence | Fix |
+|---|---|---|
+| 🔴 A. Rule overrides retroactively change pinned engagements | Silent pricing bug breaks contracted prices | **Spec resolution takes `pin_date`; engagement passes its `created_at`; override UI defaults to new-engagements-only** |
+| 🔴 B. Agents see PII in context bundles (names, emails) | GDPR input-side gap survives deletion | **Extend tokenization to `contact_name_token` + `contact_email_token` in `sensitive_data`; agents operate on tokens; UI renders via template slots** |
+| 🔴 C. D9 makes v1 an undecommissionable zombie | v1 can never shut down | **Migrate `knowledge_articles` + `sop_runbooks` to v2 at cutover; one-way sync during hybrid period; v1 archivable post-full-migration** |
+| 🟠 D. Outbox drain SPOF | Silent degradation on drain stall | **Primary Inngest + fallback Vercel cron (60s) + Supabase Edge Function monitoring on different infrastructure** |
+| 🟠 E. Stale-render → admin action race | Approval on stale evidence | **Optimistic concurrency: `evidence_event_hash` on proposals, rejected on mismatch** |
+| 🟠 F. Multi-vendor simultaneous degradation | Unpredictable compound failure | **Designed degraded mode: ≥2 vendors slow → read-only mode with visible banner; circuit-breaker trigger and recovery criteria** |
+| 🟠 G. User-name-based permissions | Admin changes = code deploys | **`user_roles` junction table; specs reference roles not usernames** |
+| 🟠 H. account_case update strategy undesigned | Either hot-query bottleneck or stale dashboard | **Hybrid: incremental updates on cheap fields, scheduled recompute on engagement lifecycle events only** |
+| 🟡 I. Solver-agent context staleness | Agent reasons over old state | **Solver re-run immediately before agent context bundle assembly** |
+| 🟡 J. engagement.completed ambiguous semantics | Consumers disagree on meaning | **Precise emission condition documented and validator-enforced** |
+| 🟡 K. spec_json SQL edit risk | Runtime drift from git source | **DB writes locked to migration role; CI hash check vs git** |
+| 🟡 L. Agent schema coupled to spec evolution | Silent drift breaks runtime | **Code-gen: `lib/agents/schemas.generated.ts` from spec engine at build time** |
+| 🟡 M. "Agents don't mutate" wording collides with auto-execute | Misleading contract | **Rewritten: agents emit; workflows execute; authority bounded by blast_radius_policy and tools** |
+| 🟡 N. No surface for deprecated spec versions | Admins blind to flagged versions | **`spec_version_warnings` table; CRM banner on flagged engagements** |
+| 🟡 O. Inngest abstraction layer implied | Vendor swap requires rewrites | **Explicit `lib/workflows/engine.ts` wrapper; all workflows route through it** |
+
+### What v1.1 does NOT change
+
+- Five-layer architecture (conceded as correct decomposition).
+- Event sourcing as substrate (conceded as right tradeoff).
+- Engagements as primary commercial object (correct with `account_case` alongside it).
+- TypeScript specs + runtime overrides (conditional on Fix 7 measurement; kill-able if ratio wrong).
+- Single Ops Agent at Stage 1 (conceded).
+- Inngest as workflow engine (conceded; now with explicit abstraction).
+- Multi-model tiering (conceded; calibration now real-time).
+- Scope, timeline, build stages (owner's decision, not architectural).
+
+### What v1.1 adds by way of scar protection
+
+Every flaw identified in Round 2 becomes a scar in `v1_scars` (now treated as design-time reference per Round 1 Fix 9, not runtime retrieval at Stage 0). The category, what_broke_in_design_review, root_cause, and smart_ai_prevention are captured for each. Future designs (Stage 1+ spec evolution, new service types) must check against these scars.
+
+---
+
 **Cutover target:** 2026-10-21 (6 months from sign-off)
 **Repo:** `TonyDuranteSystem/td-operations-smart-ai`
 **Local path (lead machine — MacBook):** `~/Developer/td-operations-smart-ai/`
@@ -517,7 +574,13 @@ CREATE INDEX idx_outbox_publishing ON outbox(locked_at) WHERE status = 'publishi
 
 `emit()` returns the event_id. The caller does not wait for the event to be *published* — only for it to be *recorded*.
 
-A separate **outbox drain worker** runs on Inngest (scheduled every 5-10 seconds, plus triggered on `outbox` insert via a Supabase Realtime subscription for low-latency):
+**Outbox drain is NOT a single point of failure in v1.1.** Three independent layers of resilience:
+
+1. **Primary drain**: Inngest scheduled function, every 10 seconds (plus Realtime-triggered on insert for low-latency).
+2. **Fallback drain**: Vercel cron function, every 60 seconds. Claims any outbox rows where `locked_at` is older than 60 seconds (primary crashed mid-batch).
+3. **Monitoring path on different infrastructure**: a Supabase Edge Function (not Inngest, not Vercel cron) runs an outbox-depth query every 30 seconds. If `SELECT count(*) FROM outbox WHERE status='pending' AND created_at < now() - interval '2 minutes' > 100`, pages via SMS (Twilio). The monitoring path must be on different infrastructure from both drains so the failure of one doesn't blind the others.
+
+A primary drain worker runs on Inngest (scheduled every 10 seconds, plus triggered on `outbox` insert via a Supabase Realtime subscription for low-latency):
 
 ```typescript
 export const outboxDrain = inngest.createFunction(
@@ -637,7 +700,7 @@ Events are organized by domain. The catalog below is the first-cutover set (Stag
 
 This catalog grows as the system grows. Adding a new event type is adding a TypeScript type definition to `lib/events/types.ts`, a Zod schema validator, and a row to a registry — not a code refactor across many files.
 
-### 5.4 emit() contract
+### 5.4 emit() contract — REVISED v1.1
 
 `emit()` is the single entry point for writing to the event log. No other code writes directly to `events` or `outbox`. This is enforced by:
 
@@ -645,11 +708,50 @@ This catalog grows as the system grows. Adding a new event type is adding a Type
 2. **Code review discipline.**
 3. **Runtime check** in CI: grep the codebase for prohibited patterns; build fails if found.
 
-The contract:
+#### Transaction size ceiling (v1.1 HARD limit)
+
+The calling transaction that wraps `emit()` MUST stay under:
+- **5 write statements** (INSERT/UPDATE/DELETE on application tables, exclusive of the event + outbox writes).
+- **200ms total wall-clock** (validated by query-plan review in CI for critical paths).
+
+**Operations exceeding this ceiling MUST decompose into multiple Inngest steps, each with its own atomic `emit()`**. There is no "outbox-only escape hatch" in v1.1 — it was replaced because split-brain between state-writes and event-emission is exactly the class of bug the outbox pattern was designed to prevent. Inngest was chosen specifically to handle composition of larger workflows; use it.
+
+**Example: payment confirmation (state changes span accounts + engagements + service_deliveries + members + notifications):**
+
+```typescript
+// lib/inngest/functions/payment-confirmed.ts
+export const paymentConfirmedFlow = inngest.createFunction(
+  { id: 'payment-confirmed-flow' },
+  { event: 'payment.confirmed' },  // triggered by outbox drain
+  async ({ event, step }) => {
+    // Step 1: update engagement status (1 write + 1 emit, atomic)
+    await step.run('activate-engagement', async () => {
+      await dbTransaction(async (tx) => {
+        await tx.from('engagements').update({ status: 'active', started_at: now() }).eq('id', event.data.engagement_id);
+        await emitInTransaction(tx, { event_type: 'engagement.started', ... });
+      });
+    });
+
+    // Step 2: generate invoice (1 write + 1 emit, atomic)
+    await step.run('generate-invoice', async () => { ... });
+
+    // Step 3: activate services (N service_deliveries; each is its own step iteration)
+    await step.run('activate-services', async () => { ... });
+
+    // Step 4: enqueue welcome communication (1 write + 1 emit, atomic)
+    await step.run('queue-welcome', async () => { ... });
+  }
+);
+```
+
+Each step is its own atomic unit. Inngest checkpoints between steps. No single transaction holds locks long enough to exhaust the connection pool.
+
+#### Idempotency-key contract (v1.1 REQUIRED for non-human actors)
 
 ```typescript
 // lib/events/emit.ts
 import { eventSchemas } from './schemas';
+import { z } from 'zod';
 
 export type EventInput<T extends EventType> = {
   event_type: T;
@@ -657,31 +759,65 @@ export type EventInput<T extends EventType> = {
   subject_id: string;
   actor_type: ActorType;
   actor_id?: string;
-  payload: EventPayload<T>;  // typed per event_type via discriminated union
+  payload: EventPayload<T>;
   caused_by?: string[];
-  idempotency_key?: string;  // optional but STRONGLY RECOMMENDED for any event from a retry-capable source (webhook, cron, AI proposal)
+  idempotency_key?: string;  // REQUIRED when actor_type IN ('webhook','cron','agent','migration')
 };
 
-export async function emit<T extends EventType>(input: EventInput<T>): Promise<{ event_id: string }> {
-  // 1. Validate payload against the event_type's Zod schema
-  const schema = eventSchemas[input.event_type];
-  const validated = schema.parse(input.payload);  // throws on invalid
+const requiresIdempotencyKey = (actor_type: ActorType) =>
+  ['webhook', 'cron', 'agent', 'migration'].includes(actor_type);
 
-  // 2. Begin transaction, insert event + outbox atomically
-  return await supabaseAdmin.rpc('emit_event', {
-    p_event_type: input.event_type,
-    p_subject_type: input.subject_type,
-    p_subject_id: input.subject_id,
-    p_actor_type: input.actor_type,
-    p_actor_id: input.actor_id ?? null,
-    p_payload: validated,
-    p_caused_by: input.caused_by ?? [],
-    p_idempotency_key: input.idempotency_key ?? null,
-  });
+export async function emit<T extends EventType>(input: EventInput<T>): Promise<{ event_id: string }> {
+  // 1. Required idempotency_key for retry-capable actors
+  if (requiresIdempotencyKey(input.actor_type) && !input.idempotency_key) {
+    throw new EmitError(`idempotency_key required for actor_type=${input.actor_type}`);
+  }
+
+  // 2. Validate payload against the event_type's Zod schema
+  const schema = eventSchemas[input.event_type];
+  const validated = schema.parse(input.payload);
+
+  // 3. Begin transaction, insert event + outbox atomically
+  return await supabaseAdmin.rpc('emit_event', { /* ... */ });
 }
 ```
 
-The `emit_event` Postgres function wraps both inserts in a single transaction and handles `idempotency_key` uniqueness gracefully — duplicate-key violations return the existing event_id instead of erroring, so webhook retries are naturally idempotent.
+#### Typed idempotency-key factories (v1.1 — namespace collision impossible)
+
+Every idempotency-key-producing source has a typed factory function with a mandatory namespace prefix. Convention drift is impossible by construction.
+
+```typescript
+// lib/events/idempotency-keys.ts
+
+/** Stripe / Whop / other webhooks — per provider + provider's event ID */
+export function webhookIdempotencyKey(provider: 'stripe' | 'whop' | 'inngest' | 'hc', providerEventId: string): string {
+  return `webhook:${provider}:${providerEventId}`;
+}
+
+/** Cron jobs — per job name + date bucket */
+export function cronIdempotencyKey(jobName: string, dateBucket: string): string {
+  return `cron:${jobName}:${dateBucket}`;
+}
+
+/** Agent invocations — per engagement + requirement + day */
+export function agentEvalIdempotencyKey(engagementId: string, requirementKey: string, dayBucket: string): string {
+  return `agent:eval:${engagementId}:${requirementKey}:${dayBucket}`;
+}
+
+/** Agent proposals — per engagement + action_type + hash of parameters */
+export function agentProposalIdempotencyKey(engagementId: string, actionType: string, paramsHash: string): string {
+  return `agent:proposal:${engagementId}:${actionType}:${paramsHash}`;
+}
+
+/** Migration imports — per source system + source id */
+export function migrationIdempotencyKey(sourceSystem: 'v1' | 'airtable' | 'hubspot', sourceId: string): string {
+  return `migration:${sourceSystem}:${sourceId}`;
+}
+```
+
+Usage is enforced: webhooks cannot construct a key with a non-webhook namespace because the factory function is typed. ESLint prohibits any string literal passed directly as `idempotency_key` — must come from a factory.
+
+The `emit_event` Postgres function wraps both inserts in a single transaction and handles `idempotency_key` uniqueness gracefully — duplicate-key violations return the existing event_id instead of erroring, so retries are naturally idempotent.
 
 ### 5.5 What the event log is NOT
 
@@ -972,27 +1108,55 @@ export async function solve(engagementId: string): Promise<StatusReport> {
 }
 ```
 
-### 7.2 Design principles
+### 7.2 Design principles — REVISED v1.1
 
-**The solver is deterministic.** Same inputs → same outputs. No randomness, no timestamps in the logic except where explicitly required (e.g., "document expired" is a time-dependent check but the time is an input, not a side effect).
+**The solver is deterministic.** Same inputs → same outputs. No randomness, no hidden state. Timestamps are inputs, not dependencies.
 
-**The solver is pure.** No DB writes. No API calls. No event emissions. It reads and computes. Purity is enforced by:
-1. **No `emit()` call inside `solve()` or any function it transitively calls.** ESLint rule + code review.
-2. **No Supabase write helper** (`dbWrite`, `dbWriteSafe`) called inside solver code paths.
-3. **Runtime check**: the solver module exports a `_ensurePure()` hook that, in test mode, wraps all DB clients with a proxy that throws on any write method.
+**The solver is idempotent and event-driven, and may queue agent work as a side effect.** (v1.0 claimed "pure" — this was dishonest design-marketing because `ai_evaluable` requirements always broke it. v1.1 states the honest contract.)
 
-**The solver is composable.** A client with Formation + Tax + RA Renewal engagements has the solver called independently per engagement. Each returns its own `StatusReport`. Compound rendering (CRM Client 360) composes them. Cross-engagement dependencies (e.g., "tax return creation requires completed formation") are expressed as spec-level references — the Tax Return spec has a requirement `formation_complete` whose condition checks for a completed Formation engagement on the same account.
+What the solver IS allowed to do:
+- Read from `events`, `engagements`, `account_members`, `contacts`, `accounts`, `service_specs`, `rule_overrides`, `exceptions`, `ai_decisions`.
+- Queue agent evaluation requests through a DEDUPLICATED side-channel (see "Agent dispatch idempotency" below).
+- Cache its own output in `solver_cache`, invalidated by events (see §7.3).
 
-**The solver handles complexity honestly.** Simple conditions (field not null, event exists) are evaluated directly. Complex conditions (post-September installment eligibility, treaty-based ITIN eligibility) are flagged `ai_evaluable` and delegated to the agent layer — but the agent does NOT run inline during `solve()`. Instead:
+What the solver is NOT allowed to do:
+- Write to `events` directly (only `emit()` writes events).
+- Call Claude or any external service synchronously (those are async through Inngest).
+- Mutate `engagements`, `accounts`, or any state entity.
 
-1. The solver reads the latest `ai.decision` event for this `(engagement_id, requirement_key)` pair.
-2. If a decision exists and is fresh (within a configurable TTL, default 24 hours), the solver uses it.
-3. If no decision exists or it is stale, the solver returns `status: 'evaluation_pending'` for that requirement and emits a workflow signal (via an Inngest event triggered by the next `emit()` call, not inline) to invoke the agent.
-4. The agent evaluates asynchronously, emits an `ai.decision` event, and the next solver invocation uses it.
+#### Agent dispatch idempotency (v1.1)
 
-This breaks the "solver is pure" promise that the original plan made while trying to include AI. The resolution: AI decisions are *events* stored in the event log; the solver reads events, not models. The AI is invoked by a separate workflow, not by the solver. Clean separation.
+When the solver encounters an `ai_evaluable` requirement with no fresh `ai.decision` event, it queues the agent. This queuing MUST be idempotent — multiple concurrent solver calls for the same requirement must NOT fan out to multiple agent invocations.
 
-### 7.3 Solver caching
+**Mechanism:**
+
+```typescript
+// Inside solve():
+if (req.ai_evaluable && !hasFreshDecision(req, engagement)) {
+  const dayBucket = todayISO();  // UTC date for deduplication window
+  const key = agentEvalIdempotencyKey(engagement.id, req.key, dayBucket);
+  await inngest.send({
+    id: key,  // Inngest-level deduplication; identical IDs collapse to single run
+    name: 'agent/evaluate.requirement',
+    data: { engagement_id: engagement.id, requirement_key: req.key },
+  });
+}
+```
+
+Inngest's event ID deduplication collapses identical events to a single workflow run within the event's lifetime. Multiple concurrent solver calls for the same `(engagement, requirement, day)` queue once — not N times.
+
+**The solver is composable.** A client with Formation + Tax + RA Renewal engagements has the solver called independently per engagement. Each returns its own `StatusReport`. Compound rendering reads from `account_case` projection (§4.2.1) for per-account priority; the CRM Client 360 composes per-engagement solver outputs for drill-down. Cross-engagement dependencies are expressed DECLARATIVELY in specs via `dependsOnEngagement()` (see §6.4.1), and the solver resolves them through the event log.
+
+**The solver handles `ai_evaluable` requirements via event references, not model calls:**
+
+1. Reads the latest `ai.decision` event for this `(engagement_id, requirement_key)` pair.
+2. If a decision exists and is fresh (within TTL — default 24 hours per requirement), uses it.
+3. If missing or stale: solver returns `status: 'evaluation_pending'` AND queues agent via the deduplicated dispatch above.
+4. Agent evaluates asynchronously, emits `ai.decision` event, outbox drain invalidates solver cache for this engagement, next solve picks up the fresh decision.
+
+Portal and CRM renderers that encounter `evaluation_pending` show an honest loading state with expected-ready time ("checking — usually resolved in 10-30 seconds") instead of a raw spinner.
+
+### 7.3 Solver caching — REVISED v1.1 with declarative cross-engagement invalidation
 
 The solver is called frequently — every portal page load, every CRM client 360 render, every Inngest workflow step that needs to check status. Without caching, each call rebuilds the full status from events, which is unnecessary work for engagements whose state hasn't changed.
 
@@ -1002,7 +1166,7 @@ The solver is called frequently — every portal page load, every CRM client 360
 CREATE TABLE solver_cache (
   engagement_id    UUID PRIMARY KEY REFERENCES engagements(id),
   status_report    JSONB NOT NULL,
-  input_hash       TEXT NOT NULL,               -- hash of (spec_version, last_event_id_for_subject, active_exceptions_hash)
+  input_hash       TEXT NOT NULL,               -- hash of (spec_version, override_set_hash_at_engagement_pin_date, last_event_id_for_subject, active_exceptions_hash)
   computed_at      TIMESTAMPTZ NOT NULL,
   valid_until      TIMESTAMPTZ                  -- optional TTL for time-dependent requirements
 );
@@ -1010,10 +1174,53 @@ CREATE TABLE solver_cache (
 CREATE INDEX idx_solver_cache_valid ON solver_cache(valid_until) WHERE valid_until IS NOT NULL;
 ```
 
-On every `emit()` call, the outbox drain worker identifies which engagements are affected (via the event's `subject_id` and related lookups — e.g., a `member.added` event affects all engagements on that account). For each affected engagement, the cache row is invalidated (set `valid_until = now()`).
+#### Cross-engagement invalidation walks the dependency graph (v1.1)
+
+On every `emit()` call, the outbox drain worker invalidates:
+
+1. **Direct subject cache.** Events with `subject_type='engagement'` invalidate the engagement's cache. Events with `subject_type='account'` invalidate all engagements on that account. Events with `subject_type='contact'` invalidate all engagements on all accounts that contact is an active member of.
+2. **Declarative cross-engagement dependencies.** Specs that declare `dependsOnEngagement({ contract_type: 'formation', account_id_match: 'self' })` create entries in a `spec_engagement_deps` table at seeding time. When an event fires for engagement A with spec-declared dependents, the invalidator JOINs against this table to find affected engagement Bs and invalidates them too.
+3. **Transitive invalidation with depth cap.** If engagement C depends on B which depends on A, and A's cache invalidates, B invalidates, which invalidates C. Depth is capped at 5 (runtime assertion; alert fires if ever hit) to prevent runaway invalidation.
+
+```sql
+CREATE TABLE spec_engagement_deps (
+  id                          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  dependent_spec_id           UUID NOT NULL REFERENCES service_specs(id),
+  dependent_spec_version      INTEGER NOT NULL,
+  dependency_contract_type    TEXT NOT NULL,      -- e.g., 'formation' — the spec that must be complete
+  dependency_match            TEXT NOT NULL,      -- 'self' (same account), 'parent', etc.
+  requirement_key             TEXT NOT NULL,      -- which requirement in dependent_spec carries this dep
+  created_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_spec_engagement_deps_lookup
+  ON spec_engagement_deps(dependency_contract_type, dependency_match);
+```
+
+**Invalidator query pattern** (simplified):
+
+```sql
+-- Given emit on engagement A, find all cached engagement Bs that depend on A
+WITH affected AS (
+  SELECT DISTINCT b.id AS engagement_id
+  FROM engagements a
+  JOIN spec_engagement_deps d ON d.dependency_contract_type = a.contract_type
+  JOIN engagements b ON (
+    d.dependency_match = 'self' AND b.account_id = a.account_id
+    AND b.spec_id = d.dependent_spec_id
+    AND b.spec_version = d.dependent_spec_version
+  )
+  WHERE a.id = $1
+)
+UPDATE solver_cache
+SET valid_until = now()
+WHERE engagement_id IN (SELECT engagement_id FROM affected);
+```
+
+The query is indexed. At 100 events/sec with typical dependency graphs (~2-3 deps per spec), invalidation overhead is <5ms per event. Benchmark tested in Stage 0 S0.5.
 
 On solve request:
-1. Compute current `input_hash`.
+1. Compute current `input_hash` (includes override_set_hash filtered by engagement's pin_date).
 2. Check cache: if `engagement_id` row exists AND `input_hash` matches AND `valid_until > now()`, return cached `status_report`.
 3. Else, compute fresh. Write to cache. Return.
 
@@ -1124,34 +1331,55 @@ The Ops Agent is a stateless-per-invocation TypeScript function. Each invocation
 
 The agent never directly writes to core tables. It emits events. Events drive state changes via workflows. This keeps the agent auditable, reversible, and within the authority layer of the rest of the system.
 
-### 8.3 Context bundle per invocation
+### 8.3 Context bundle per invocation — REVISED v1.1 (tokenized PII, fresh solver, no free-form names)
 
-A well-formed agent invocation receives:
+#### PII posture: agents operate on tokens, not raw values (v1.1 fix for 🔴 Flaw B)
+
+v1.0 claimed agents don't see PII but the context bundle in v1.0 included full `ContactRecord` with raw names and emails. v1.1 fixes this at the source: contact names and emails are tokenized in `sensitive_data` (§14.1), and the agent's context bundle contains only tokens.
 
 ```typescript
+type TokenizedContactRecord = {
+  id: string;
+  name_token: string;              // resolves to full_name via sensitive_data for UI
+  email_token: string;             // same for primary email
+  phone_token: string | null;
+  language: string;                // not PII
+  preferred_channel: 'email' | 'portal' | 'sms';
+  citizenship: string | null;      // relevant for ITIN / tax decisions, not PII per se
+  residency: string | null;
+  portal_tier: PortalTier;
+  kyc_status: string;
+  // structured PII tokens
+  passport_token: string | null;
+  itin_token: string | null;
+  dob_token: string | null;
+  address_token: string | null;
+  // no raw names, emails, phone numbers, or addresses
+};
+
 type OpsAgentContextBundle = {
-  // Target
+  // Target (tokenized)
   engagement: EngagementRecord;
-  account: AccountRecord | null;
-  contact: ContactRecord;
-  members: AccountMemberRecord[];        // if MMLLC or multi-member
+  account: AccountRecord | null;            // company name is NOT PII (business entity public)
+  contact: TokenizedContactRecord;
+  members: TokenizedMemberRecord[];
 
-  // Current state
-  solver_report: StatusReport;           // latest from Layer 4
-  recent_events: EventRecord[];          // last 50 events on this engagement/account
-  active_exceptions: ExceptionRecord[];
+  // Current state — SOLVER RE-RUN IMMEDIATELY BEFORE BUNDLE (v1.1 fix for 🟡 Flaw I)
+  solver_report: StatusReport;              // freshly computed; not stale cached
+  recent_events: EventRecord[];             // last 50; payloads already tokenized
+  active_exceptions: ExceptionRecord[];     // reason text scrubbed of PII at emit (§14)
 
-  // Historical context
+  // Historical context (tokenized)
   past_proposals_for_engagement: ProposalRecord[];
   past_communications_to_contact: CommunicationEventRecord[];
 
-  // Retrieval results
+  // Retrieval results (SOP chunks and scars do not contain client PII)
   relevant_sops: { title: string; excerpt: string; citation: string; }[];
-  relevant_scars: ScarRecord[];          // from v1_scars via pgvector on query signature
+  relevant_scars: ScarRecord[];
 
   // Policy context
   applicable_rule_overrides: RuleOverrideRecord[];
-  blast_radius_policy: BlastRadiusPolicy;  // what agent is allowed to auto-execute for this kind of action
+  blast_radius_policy: BlastRadiusPolicy;
 
   // Request
   task: {
@@ -1163,12 +1391,20 @@ type OpsAgentContextBundle = {
 };
 ```
 
+#### The agent sees tokens, the UI sees names
+
+The agent's output is structured template-slot format (§8.5 REVISED). When the output is rendered for an admin or client, a thin rendering layer joins tokens to current values from `sensitive_data`. If the contact has been GDPR-deleted, tokens resolve to `(deleted)` and the UI displays redacted placeholder. Audit trail preserved; PII gone.
+
+#### Bundle assembly contract (v1.1)
+
 The bundle is assembled by `lib/agents/context.ts::buildContextBundle(engagement_id, task)`. It:
 
-1. Parallelizes all reads (Supabase + pgvector).
-2. Uses prompt caching: the context bundle format is stable; the outer prompt template + system instructions are cached, reducing cost by ~60-70% on input tokens on cache hits.
-3. Is bounded in size — recent_events capped at 50, past_proposals capped at 10, relevant_sops/scars capped at 5 each.
-4. Is deterministic given the same engagement state — same inputs produce the same bundle, enabling test replays and cache comparisons.
+1. **Re-runs solver immediately before assembly** (v1.1 fix for 🟡 Flaw I). Never uses cached solver output that's been invalidated between agent-dispatch time and bundle-assembly time.
+2. Parallelizes all reads (Supabase + pgvector).
+3. Uses prompt caching on the stable portions (system prompt, SOP corpus excerpts, scar retrieval results). Cache hit rate target >60%.
+4. Is bounded in size — recent_events capped at 50, past_proposals capped at 10, relevant_sops/scars capped at 5 each.
+5. Is deterministic given the same engagement state — same inputs produce the same bundle.
+6. **All free-form text fields in the bundle have been pre-emit scrubbed** (§14.1 REVISED) — the bundle cannot contain raw client names/emails even transiently.
 
 ### 8.4 Retrieval architecture — pgvector
 
@@ -1216,40 +1452,95 @@ CREATE INDEX idx_v1_scars_category ON v1_scars(category);
 
 **Embeddings cost:** negligible. 225 × ~50 SOPs average × chunks × $0.02 per 1M tokens ≈ <$1 per full re-embed. Runs daily.
 
-### 8.5 Structured outputs — preventing hallucination
+### 8.5 Structured outputs — REVISED v1.1 (template-slot pattern prevents PII in free-form text)
 
-Every agent response is constrained by a Zod schema. The model is instructed — and technically constrained via Anthropic's tool-use / structured-output API — to produce output that matches the schema. This eliminates the class of failures where the model "invents" a citation or produces malformed JSON.
+Every agent response is constrained by a Zod schema generated at build time from the spec engine (§8.5.1 — code-gen fix for 🟡 Flaw L). The model is technically constrained via Anthropic's tool-use API to produce output that matches the schema. This eliminates two classes of failure: (a) model invents a citation or produces malformed JSON; (b) model writes a client's name into a reasoning field that survives GDPR deletion.
 
-Example schemas:
+#### The template-slot contract — no free-form PII in any agent output
+
+v1.0 had `rationale: z.string().min(30)` and `reasoning: z.string().min(20)` as free-form text fields. In v1.0, the model would routinely write "Marco Rossi has been missing his passport for 10 days, send reminder" — which survives the event log forever and breaks GDPR on deletion.
+
+v1.1 replaces free-form text with **template references + typed slot arguments**:
 
 ```typescript
 // For requirement evaluation
 const aiDecisionSchema = z.object({
   decision: z.enum(['eligible','not_eligible','requires_human_review']),
   confidence: z.number().min(0).max(1),
-  reasoning: z.string().min(20),
+
+  // Reasoning template — the agent selects from a finite set of templates authored in `lib/agents/reasoning-templates.ts`
+  // Templates are authored with slot placeholders: {{days_pending}}, {{requirement_key}}, {{contact_token}}
+  // Slots are filled with values the schema validates as non-PII (tokens or typed non-identifying fields)
+  reasoning_template_id: z.enum(['cutoff_date_passed','documents_complete','depends_on_blocker','policy_exception_applies','ambiguous_edge_case','precedent_from_similar', /* ... */]),
+  reasoning_slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
+
+  // Evidence must reference structured records, not contain narrative text
   evidence_cited: z.array(z.object({
     source_type: z.enum(['sop_chunk','scar','event','document']),
-    source_id: z.string(),       // UUID or structured ID
-    excerpt: z.string(),
+    source_id: z.string().uuid(),
+    excerpt_token: z.string().regex(/^excerpt:/),  // token resolving to SOP text (not client PII)
   })).min(1),
-  recommendation: z.string(),
+
+  recommendation_template_id: z.enum(['file_ss4','send_reminder','escalate_for_review','grant_exception','await_client_action', /* ... */]),
+  recommendation_slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
 });
 
-// For proposal generation
+// For proposal generation — same pattern
 const proposalSchema = z.object({
   action_type: z.enum(['send_reminder','create_invoice','advance_stage','request_document','escalate','draft_communication']),
-  parameters: z.record(z.unknown()),
-  rationale: z.string().min(30),
+
+  // Parameters are structured with typed fields; no free-form text that could carry PII
+  parameters: z.object({
+    template_id: z.string(),                 // which communication template (for send_reminder, draft_communication)
+    slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
+    target_contact_token: z.string().regex(/^token:contact:/),
+    target_channel: z.enum(['email','portal_notification','sms']),
+  }),
+
+  // Rationale is a template + slots, same as decision reasoning
+  rationale_template_id: z.enum([/* enumerated catalog */]),
+  rationale_slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
+
   confidence: z.number().min(0).max(1),
   scar_matches: z.array(z.string()).optional(),
   blast_radius: z.enum(['client_visible','admin_only','internal_only']),
-  alternative_considered: z.string(),   // R101 enforcement in agent output
-  weakness_acknowledged: z.string(),    // R101 enforcement
+
+  // R101 devil's-advocate discipline — also template-based
+  alternative_considered_template_id: z.string(),
+  alternative_considered_slots: z.record(z.unknown()),
+  weakness_acknowledged_template_id: z.string(),
+  weakness_acknowledged_slots: z.record(z.unknown()),
 });
 ```
 
-The `alternative_considered` and `weakness_acknowledged` fields are R101's five-question discipline embedded in agent output. Every proposal the agent produces includes its own devil's-advocate check — surfaced to the admin reviewing the proposal, so the admin sees not just "what to do" but also "what else was considered" and "how this could be wrong."
+**Rendering:**
+
+- Admin UI, portal, and audit reports join `template_id + slots` against `reasoning_templates` table plus resolve any tokens via `sensitive_data` for display. Rendered text shown to admin.
+- Event log payload contains `template_id + slots` only — no resolved text. GDPR-safe.
+- If a template requires text not currently expressible as a slot (genuinely new business language), the admin adds the template to `reasoning_templates` (CRM-editable); NOT the LLM inventing it inline.
+
+#### What this costs
+
+- **Template catalog maintenance.** `reasoning_templates` starts with ~50 templates covering common decision shapes. Grows to ~200-300 at steady state. Manageable.
+- **Model expressiveness narrowed slightly.** The model cannot invent a new way to explain something; it picks from the catalog. For novel situations, it uses `ambiguous_edge_case` template and explicit slot `escalate_reason_token: 'escalation:novel'` with a standardized escalation template that a human interprets.
+- **Build complexity.** Adding a new template = row + slot type. No code change unless the slot type is genuinely new (rare).
+
+#### Enforcement
+
+- Zod schema validation on every agent response. Mismatch = retry with guidance (up to 2); then escalate.
+- CI check: all `template_id` values in agent outputs must exist in `reasoning_templates` and `proposal_templates` at deploy time. Orphan references fail the build.
+- Pre-emit scrubber (§14.1 REVISED) is a belt-and-suspenders secondary control on any free-form field that still exists in the system (e.g., exception reasons typed by humans).
+
+### 8.5.1 Agent schema code-gen (v1.1 fix for 🟡 Flaw L)
+
+The Zod schemas above are NOT hand-written. They are generated at build time from the spec engine and template catalog:
+
+- `lib/specs/*.ts` — specs declare what their requirements' evaluation contracts look like.
+- `lib/agents/reasoning-templates.ts` — reasoning template catalog (committed; sourced from `reasoning_templates` table via seed).
+- `scripts/generate-agent-schemas.ts` — reads specs + templates at build time, emits `lib/agents/schemas.generated.ts`.
+- CI fails if `schemas.generated.ts` is out of sync with source.
+
+Schema drift between specs and agent outputs becomes impossible by construction.
 
 ### 8.6 Multi-model tiering
 
@@ -2108,17 +2399,20 @@ The resolution: the auto-approval threshold measurement is the governor. When an
 
 Designed upfront, not retrofitted. PII tokenization is a line-one decision; RLS policies are specified before any table seeding; webhook signatures are verified on every inbound call. The system assumes adversarial conditions and defends explicitly.
 
-### 14.1 PII tokenization model
+### 14.1 PII tokenization model — REVISED v1.1 (names and emails also tokenized)
 
-Raw PII never lives in event payloads, log lines, or most application tables. Instead:
+Raw PII never lives in event payloads, log lines, or most application tables. Instead, PII is stored in `sensitive_data` and referenced via opaque tokens everywhere else.
+
+**v1.1 expansion (fix for 🔴 Flaw B):** tokenization covers `contact_name`, `contact_email`, and `contact_phone` in addition to the structured identifiers. v1.0 treated names/emails as "normal columns" — that was a GDPR gap on the input side of agents (agents saw raw names in context bundles).
 
 ```sql
 CREATE TABLE sensitive_data (
-  token             TEXT PRIMARY KEY,                     -- opaque identifier, e.g., 'sd_a7f8c2b1'
+  token             TEXT PRIMARY KEY,                     -- opaque, e.g., 'token:contact:name:a7f8c2b1' or 'token:passport:f3a9...'
   subject_type      TEXT NOT NULL,                        -- 'contact' | 'account' | 'engagement'
   subject_id        UUID NOT NULL,
   data_type         TEXT NOT NULL CHECK (data_type IN (
-    'passport_number','itin','ein','ssn','dob','address','bank_account','phone'
+    'contact_full_name','contact_first_name','contact_last_name','contact_email','contact_email_2','contact_phone','contact_phone_2',
+    'passport_number','itin','ein','ssn','dob','address','bank_account'
   )),
   encrypted_value   TEXT NOT NULL,                        -- pgcrypto AES-256 encrypted
   value_hash        TEXT NOT NULL,                        -- SHA-256 hash for lookup without decryption
@@ -2132,21 +2426,82 @@ CREATE INDEX idx_sensitive_data_subject ON sensitive_data(subject_type, subject_
 CREATE INDEX idx_sensitive_data_hash ON sensitive_data(value_hash);
 ```
 
-Tables that reference PII hold the token, not the value:
+Tables that reference PII hold the token, not the value. The `contacts` table schema (updated from §4.1):
 
 ```sql
--- Instead of: contacts.passport_number TEXT
-contacts.passport_number_token TEXT REFERENCES sensitive_data(token);
+-- v1.1 — all PII columns are tokens, not raw values
+CREATE TABLE contacts (
+  id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  full_name_token           TEXT NOT NULL REFERENCES sensitive_data(token),
+  first_name_token          TEXT REFERENCES sensitive_data(token),
+  last_name_token           TEXT REFERENCES sensitive_data(token),
+  email_token               TEXT NOT NULL REFERENCES sensitive_data(token),
+  email_2_token             TEXT REFERENCES sensitive_data(token),
+  phone_token               TEXT REFERENCES sensitive_data(token),
+  phone_2_token             TEXT REFERENCES sensitive_data(token),
+  passport_token            TEXT REFERENCES sensitive_data(token),
+  itin_token                TEXT REFERENCES sensitive_data(token),
+  dob_token                 TEXT REFERENCES sensitive_data(token),
+  address_token             TEXT REFERENCES sensitive_data(token),
 
--- Event payload for 'account.ein_received' includes:
--- { ein_token: 'sd_f3a9...', received_date: '2026-04-15' }
--- NOT: { ein_number: '12-3456789' }
+  -- Non-PII fields (stay as-is)
+  language                  TEXT,
+  preferred_channel         TEXT,
+  citizenship               TEXT,
+  residency                 TEXT,
+  portal_tier               TEXT,
+  kyc_status                TEXT,
+  -- ... operational fields
+  created_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
+  is_test                   BOOLEAN NOT NULL DEFAULT false
+);
 ```
 
-Reading PII:
-- A service-role-level Postgres function `get_sensitive_value(token, purpose)` takes a token + a documented purpose string, checks the caller's role, logs the access (`access_count++`, `last_accessed_at`), decrypts and returns.
-- Application code uses this function only when PII is needed (rendering in admin UI, generating a signed PDF, making an API call to an external service that requires raw value). Otherwise code passes tokens around.
-- Agents do not have access to PII values. They see redacted representations (e.g., passport token → "passport-on-file" marker without the number).
+**Event payloads always use tokens.** Example `account.ein_received`:
+
+```json
+{
+  "ein_token": "token:ein:f3a9b2c1",
+  "received_date": "2026-04-15"
+}
+```
+
+Not `{ "ein_number": "12-3456789" }`. Never.
+
+**Agent context bundles always use tokens.** `TokenizedContactRecord` (§8.3) replaces raw `ContactRecord`. Agents NEVER see decrypted PII.
+
+**Reading PII (the narrow authorized path):**
+- `get_sensitive_value(token, purpose)` Postgres function — takes a token + a documented purpose string, checks the caller's role, logs the access (`access_count++`, `last_accessed_at`), decrypts and returns.
+- Application code uses this function ONLY when PII is actually needed:
+  - **UI rendering** (admin sees "Marco Rossi" on a client page; portal sees the client's own name).
+  - **Signed document generation** (SS-4, OA, Lease embed the real name).
+  - **External API calls** that require raw value (Harbor Compliance, Stripe Customer creation).
+- Every other code path passes tokens. Agents receive tokens. Event log stores tokens. Logs (Sentry) receive tokens — the UI only decrypts at render time.
+
+**Rendering layer: tokens → display strings**
+
+```typescript
+// lib/rendering/pii.ts
+export async function renderTemplateWithSlots(
+  templateId: string,
+  slots: Record<string, string | number>,
+  viewer: AuthContext
+): Promise<string> {
+  const template = await getTemplate(templateId);  // from reasoning_templates or proposal_templates
+  const resolvedSlots: Record<string, string> = {};
+  for (const [key, value] of Object.entries(slots)) {
+    if (typeof value === 'string' && value.startsWith('token:')) {
+      resolvedSlots[key] = await resolveToken(value, viewer, 'display');  // authorized read
+    } else {
+      resolvedSlots[key] = String(value);
+    }
+  }
+  return interpolate(template.text, resolvedSlots);
+}
+```
+
+If a contact is GDPR-deleted, tokens resolve to `(deleted)` and the UI displays redacted placeholder. Audit trail preserved; PII gone.
 
 ### 14.2 RLS (Row-Level Security) policies
 
@@ -2211,24 +2566,49 @@ A forged webhook is rejected *before* any `emit()` call. Rejection logs with `we
 
 Secret rotation: each secret is stored in Supabase Vault (not .env). Rotation is an ops task with a documented procedure. Stripe and Whop support webhook secret rotation with grace periods; we use the grace period to rotate without downtime.
 
-### 14.4 GDPR deletion
+### 14.4 GDPR deletion — REVISED v1.1 (structurally complete with tokenized names)
 
 When a contact requests GDPR deletion:
 
 1. Admin initiates the deletion workflow via CRM (not exposed to clients directly — verify identity first).
 2. A workflow (Inngest) runs:
-   a. Identify all `sensitive_data` rows for the contact. Delete.
-   b. Null out the `contacts` row's personal fields (name becomes "(deleted)", email becomes null, etc.). Keep the row for referential integrity.
-   c. Emit `contact.gdpr_deleted` event (not `contact.deleted` — the reference still exists).
-   d. Notify any downstream systems (QuickBooks, Stripe, Whop) where the contact may have records.
-3. Events referencing the contact via token still exist; the token now resolves to `(deleted)` when queried. Audit trail is preserved; raw PII is gone.
+   a. Identify all `sensitive_data` rows for the contact (structured identifiers, names, emails, phones, addresses). Delete.
+   b. `contacts` row stays (referential integrity) — tokens now reference deleted sensitive_data rows; `resolve_token()` returns `(deleted)` for display.
+   c. Emit `contact.gdpr_deleted` event (not `contact.deleted` — the reference still exists in events for audit).
+   d. Notify any downstream systems (QuickBooks, Stripe, Whop) where the contact may have records; initiate per-provider deletion via their APIs.
+3. Event payloads referencing the contact via tokens still exist; tokens resolve to `(deleted)` at render time. Audit trail is preserved; raw PII is gone.
+
+**Why v1.1's structural tokenization makes this clean:** v1.0's free-form agent reasoning ("Marco Rossi has been waiting 10 days") would have survived deletion as orphan PII. v1.1's template-slot outputs contain only tokens, so deletion of sensitive_data automatically redacts the rendered form. No post-hoc scrubbing of event payloads is required.
+
+**Secondary control for any remaining free-form fields** (e.g., exception reasons typed by admins, chat messages): pre-emit NER + regex scrubber runs at `emit()` entry. Detected names, emails, phone numbers, addresses in free-form fields are replaced with tokens before the event is written. This catches the residual gap that structure alone doesn't close.
+
+```typescript
+// lib/events/emit.ts (excerpt)
+async function scrubPayloadForPII(eventType: string, payload: unknown): Promise<unknown> {
+  const freeFormFields = getFreeFormFieldsForEvent(eventType);  // declared per event type
+  for (const field of freeFormFields) {
+    const text = getField(payload, field);
+    if (text) {
+      const scrubbed = await scrubText(text);  // NER + regex
+      setField(payload, field, scrubbed.text);
+      if (scrubbed.replacements.length) {
+        // Log for audit + allow retrieval through sensitive_data
+        await storeScrubRecord(eventType, field, scrubbed.replacements);
+      }
+    }
+  }
+  return payload;
+}
+```
+
+Scrubber caught tokens still resolve via `sensitive_data` at render time (admins see original, clients see what they're authorized to see). GDPR deletion wipes the sensitive_data rows; scrubbed tokens in historical payloads resolve to `(deleted)`.
 
 Document retention policies (per applicable jurisdiction — we follow the more conservative US-state and EU-resident rules):
 - Financial records (invoices, payments): 7 years minimum retention.
 - Contracts and identifying documents: 7 years.
 - Communication history: 3 years default, longer if legally required.
 
-Automatic deletion cron: runs monthly, deletes data past retention thresholds. Soft-deleted first (status='pending_purge'), then hard-deleted after 30-day grace.
+Automatic deletion cron: runs monthly, deletes data past retention thresholds. Soft-deleted first (`status='pending_purge'`), then hard-deleted after 30-day grace.
 
 ### 14.5 Authentication, authorization, sessions
 
