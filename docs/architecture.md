@@ -918,4 +918,602 @@ The resolution: `ai_evaluable` requires approval in code review. Every new `ai_e
 
 ---
 
-*(Plan continues in Part 2, next turn. Remaining sections: Layer 4 Solver, Layer 5 Ops Agent, Scar Index, Portal UX, CRM UX, Exception Handling, Business Rules, Security/PII, Claude API, Inngest, Infrastructure, Observability, Build Stages, Migration, Governance, Cost Model, Appendices A-E.)*
+---
+
+## 7. Layer 4 — The Solver
+
+The solver is the brain of the system. It takes a specification and the current state of an engagement and returns a complete status report: what's done, what's missing, what's blocked, what's possible right now, and what exceptions are active. The solver is the single source of truth that powers the portal, the CRM, the agent's context, and every scheduled follow-up.
+
+### 7.1 The solver contract
+
+```typescript
+// lib/solver/solve.ts
+type StatusReport = {
+  engagement_id: string;
+  spec_id: string;
+  spec_version: number;
+  overall_progress: number;            // 0.0 to 1.0
+  requirements: RequirementStatus[];
+  exceptions_active: ExceptionRecord[];
+  next_actions: NextAction[];
+  evaluation_pending: string[];        // requirement keys awaiting ai_evaluable
+  computed_at: string;                 // ISO timestamp
+  cache_key: string;                   // hash of inputs used
+};
+
+type RequirementStatus = {
+  key: string;
+  type: 'gate' | 'data' | 'document' | 'deliverable';
+  status: 'satisfied' | 'possible' | 'blocked' | 'missing' | 'evaluation_pending' | 'satisfied_by_exception';
+  satisfied_at?: string;
+  evidence_event_ids?: string[];       // which events provided evidence
+  blocked_by?: string[];               // requirement keys blocking this one
+  scope?: { per_member?: boolean; contact_id?: string };
+  action_hint?: string;                // from spec ai_hint
+  exception_id?: string;               // if status = satisfied_by_exception
+};
+
+type NextAction = {
+  priority: number;                    // 1 = highest
+  action: string;                      // human-readable
+  target: 'client' | 'admin' | 'agent';
+  channel?: 'portal_notification' | 'email' | 'task' | 'agent_queue';
+  requirement_key: string;
+};
+
+export async function solve(engagementId: string): Promise<StatusReport> {
+  // 1. Load engagement + spec + events (bounded by subject_id)
+  // 2. Load active exceptions for this engagement
+  // 3. For each requirement in the spec, evaluate against events + entity state
+  // 4. Compute dependency topology: which requirements are blocked
+  // 5. For ai_evaluable requirements, read the latest ai.decision event; if none or stale, queue evaluation
+  // 6. Compute next_actions by priority
+  // 7. Return; do NOT write
+}
+```
+
+### 7.2 Design principles
+
+**The solver is deterministic.** Same inputs → same outputs. No randomness, no timestamps in the logic except where explicitly required (e.g., "document expired" is a time-dependent check but the time is an input, not a side effect).
+
+**The solver is pure.** No DB writes. No API calls. No event emissions. It reads and computes. Purity is enforced by:
+1. **No `emit()` call inside `solve()` or any function it transitively calls.** ESLint rule + code review.
+2. **No Supabase write helper** (`dbWrite`, `dbWriteSafe`) called inside solver code paths.
+3. **Runtime check**: the solver module exports a `_ensurePure()` hook that, in test mode, wraps all DB clients with a proxy that throws on any write method.
+
+**The solver is composable.** A client with Formation + Tax + RA Renewal engagements has the solver called independently per engagement. Each returns its own `StatusReport`. Compound rendering (CRM Client 360) composes them. Cross-engagement dependencies (e.g., "tax return creation requires completed formation") are expressed as spec-level references — the Tax Return spec has a requirement `formation_complete` whose condition checks for a completed Formation engagement on the same account.
+
+**The solver handles complexity honestly.** Simple conditions (field not null, event exists) are evaluated directly. Complex conditions (post-September installment eligibility, treaty-based ITIN eligibility) are flagged `ai_evaluable` and delegated to the agent layer — but the agent does NOT run inline during `solve()`. Instead:
+
+1. The solver reads the latest `ai.decision` event for this `(engagement_id, requirement_key)` pair.
+2. If a decision exists and is fresh (within a configurable TTL, default 24 hours), the solver uses it.
+3. If no decision exists or it is stale, the solver returns `status: 'evaluation_pending'` for that requirement and emits a workflow signal (via an Inngest event triggered by the next `emit()` call, not inline) to invoke the agent.
+4. The agent evaluates asynchronously, emits an `ai.decision` event, and the next solver invocation uses it.
+
+This breaks the "solver is pure" promise that the original plan made while trying to include AI. The resolution: AI decisions are *events* stored in the event log; the solver reads events, not models. The AI is invoked by a separate workflow, not by the solver. Clean separation.
+
+### 7.3 Solver caching
+
+The solver is called frequently — every portal page load, every CRM client 360 render, every Inngest workflow step that needs to check status. Without caching, each call rebuilds the full status from events, which is unnecessary work for engagements whose state hasn't changed.
+
+**Event-driven cache invalidation:**
+
+```sql
+CREATE TABLE solver_cache (
+  engagement_id    UUID PRIMARY KEY REFERENCES engagements(id),
+  status_report    JSONB NOT NULL,
+  input_hash       TEXT NOT NULL,               -- hash of (spec_version, last_event_id_for_subject, active_exceptions_hash)
+  computed_at      TIMESTAMPTZ NOT NULL,
+  valid_until      TIMESTAMPTZ                  -- optional TTL for time-dependent requirements
+);
+
+CREATE INDEX idx_solver_cache_valid ON solver_cache(valid_until) WHERE valid_until IS NOT NULL;
+```
+
+On every `emit()` call, the outbox drain worker identifies which engagements are affected (via the event's `subject_id` and related lookups — e.g., a `member.added` event affects all engagements on that account). For each affected engagement, the cache row is invalidated (set `valid_until = now()`).
+
+On solve request:
+1. Compute current `input_hash`.
+2. Check cache: if `engagement_id` row exists AND `input_hash` matches AND `valid_until > now()`, return cached `status_report`.
+3. Else, compute fresh. Write to cache. Return.
+
+Cache fills gradually under load. First-request latency is unchanged; subsequent reads are O(1) until invalidation.
+
+### 7.4 Solver evaluation logic
+
+For each requirement in the spec, the solver runs:
+
+**If `type: gate`:** evaluate condition. If met, `status: satisfied`. Gate requirements block everything else (or a specified subset via `blocks`).
+
+**If `type: data`:** evaluate the field condition against the entity state (`account`, `contact`, `engagement`). Field not null / equals / in list / etc. If met, `status: satisfied`.
+
+**If `type: document`:** check for a `document.uploaded` event (and absence of `document.expired`) matching the spec's condition. For `per_member` requirements, iterate over `account_members where left_at IS NULL` and report status per-member.
+
+**If `type: deliverable`:** check for the specified event type (e.g., `account.ein_received`). If the event exists and is recent enough (per spec), `status: satisfied`.
+
+**Dependency resolution:**
+After each requirement is evaluated in isolation, the solver runs a topological pass:
+- For each requirement with `depends_on`, if any dependency is not `satisfied` or `satisfied_by_exception`, mark this requirement `blocked` and record `blocked_by: [dependency keys]`.
+- If all dependencies are satisfied AND this requirement is not satisfied, mark `possible` (ready to work on).
+
+**Exception handling:**
+- For each active exception on this engagement (from the `exceptions` table, `status = 'active'`), find the referenced requirement and override its status to `satisfied_by_exception`. Downstream requirements that depended on it become unblocked naturally.
+
+### 7.5 Next actions computation
+
+Once statuses are computed, the solver produces a prioritized list of next actions:
+
+```typescript
+// For each requirement:
+// - If status = 'missing' and type = 'document' (per_member): next_action targets the specific member, channel = 'portal_notification'
+// - If status = 'missing' and type = 'data': next_action targets either client (if data comes from wizard) or admin (if data is admin-entered)
+// - If status = 'possible' and type = 'deliverable': next_action targets admin via 'task' channel (TD must file, send, confirm)
+// - If status = 'blocked': no next action (propagates upstream)
+// - If status = 'evaluation_pending': queue agent evaluation
+```
+
+Priority is set by:
+1. **Gates always first** (payment is the canonical gate).
+2. **Within the same status level**, shorter `depends_on` chains come first (closer to "done" than "foundational").
+3. **Age of request** — a missing requirement that's been `missing` longer has higher priority than a just-became-missing one.
+4. **Client-visible actions** are bumped above admin-invisible ones (move the client forward).
+
+### 7.6 Solver rationale and devil's-advocate flags
+
+**[R101-FLAG on cache invalidation correctness.]** Event-driven cache invalidation requires that every event that could change a solver output triggers cache invalidation. If we forget to wire up invalidation for some event type, the cache serves stale data silently.
+
+The resolution: the drain worker has a *generic* invalidation rule — it looks at the `subject_type` + `subject_id` of every event and invalidates all engagements linked to that subject. The only exception is events that are known to have no solver impact (e.g., `communication.opened`); those are in an explicit allowlist of "non-invalidating" event types. This is safer than the inverse (specify which events DO invalidate), because the default is correctness over performance. An unknown new event type invalidates the cache and re-runs the solver — fine; a small performance cost, not a correctness bug.
+
+**[R101-FLAG on evaluation_pending deadlocks.]** What if an agent's `ai_evaluable` decision is required for a requirement, but the workflow that triggers the agent fails silently and never produces an `ai.decision` event? The solver perpetually returns `evaluation_pending`.
+
+The resolution: the agent workflow is governed by Inngest's step functions with automatic retries and alerting. If after N retries and T time the decision is still missing, a `proposal.created` event surfaces the stuck requirement to the admin inbox: "Agent evaluation failing for requirement X on engagement Y; manual decision required." An admin can answer directly, which emits `ai.decision` with `actor_type: 'human'` and unblocks the solver. Stuck evaluations are observable, not silent.
+
+**[R101-FLAG on solver performance at 1,000 clients.]** If a single engagement has thousands of events (long-lived clients with many services), the solver's event scan can become expensive. At 1,000 clients × tens of solver calls per day × expensive scans, latency grows.
+
+The resolution: two optimizations deferred to Stage 2+ but designed for now:
+1. **Event scan pruning.** The solver reads only events for `subject_id IN (engagement_id, account_id, member_contact_ids)` filtered by `event_type IN (relevant_types_per_spec)`. Indices support this. Scan stays bounded.
+2. **Materialized per-requirement evidence table.** For slow-evolving requirements (e.g., `ein`, satisfied once and never re-evaluated), we can materialize the satisfaction event reference on first satisfaction and query it directly rather than re-scanning events. This is a Stage 2+ optimization; not built at Stage 0.
+
+**[R101-FLAG on cross-engagement dependency evaluation.]** A Tax Return engagement has a requirement `formation_complete` that depends on the sibling Formation engagement. When the solver evaluates the Tax engagement, does it recursively call `solve()` on the Formation engagement? That could cause deep recursion on accounts with many service engagements.
+
+The resolution: cross-engagement dependencies are expressed as event references, not recursive spec references. `formation_complete` is a requirement whose condition is "an `engagement.completed` event exists for an engagement of `contract_type='formation'` on the same `account_id`." The solver reads events, not other solver results. No recursion. If the formation-complete event hasn't fired, the tax requirement is `blocked` and shows `blocked_by: ['formation_complete']`; the admin clicks into the formation engagement directly to see its own status.
+
+---
+
+## 8. Layer 5 — Ops Agent and AI Infrastructure
+
+The Ops Agent is the intelligent layer that transforms solver output into proposed actions, interprets ambiguous SOP rules, and provides live context on CRM client pages. It is one agent at Stage 1 — not six. Specialization emerges later, only when justified.
+
+### 8.1 Why a single agent at Stage 1
+
+Research (2026 production agent analysis including Anthropic, Vellum, Virtido, Beam, and arxiv/2512.08769):
+
+> *"A single agent with a clear goal, a few tools, and good prompting solves more than most teams expect. The mistake engineers make is jumping straight to multi-agent architectures because they sound more capable. They're not inherently more capable. They're more complex, which means more failure surfaces."*
+
+And:
+
+> *"The real question is whether your task can be decomposed into parallel workstreams. If steps must happen sequentially and share state, a single agent with a planning loop handles it cleanly. If independent subtasks can run concurrently, that's where multi-agent pays off."*
+
+Smart AI's workflows at Stage 1 are almost entirely sequential: a formation moves through stages; an onboarding follows a sequence; a tax intake gathers data before routing. Multi-agent at Stage 1 would create coordination overhead (hand-offs, context sharing, disagreement resolution) for no parallelism benefit.
+
+**Specialist agents emerge when:**
+- A domain requires different model tier consistently (e.g., Tax/Compliance always benefits from Opus-level reasoning; Triage always benefits from Haiku-level speed).
+- A domain has distinct tool sets that don't intersect with other domains.
+- Concurrent workloads in different domains create queue contention in a single agent.
+
+Expected Stage 1+ specialist split (not Stage 1):
+1. **Triage Agent** — classify inbound emails, portal messages, documents; route to the right engagement. Cheap model (Haiku).
+2. **Compliance Agent** — watches solver output for missing requirements, overdue items, approaching deadlines; generates proposals. Mixed tier.
+3. **Communications Agent** — drafts messages (reminders, status updates, responses); reviews outgoing text for tone and accuracy. Mixed tier.
+4. **Billing Agent** — watches payment events, invoice creation, overdue state; routine work on Haiku, anomalies on Opus.
+5. **Tax Agent** — knows tax-return workflows, deadlines, India-routing rules. Opus-heavy for ambiguous returns.
+6. **Portal-Support Agent** — handles client chat questions in the portal; cheap model with human escalation.
+
+Stage 1 ships the single Ops Agent with all of these responsibilities combined. Specialization is promoted as Stage 1+ when operational signal justifies it.
+
+### 8.2 Agent architecture
+
+The Ops Agent is a stateless-per-invocation TypeScript function. Each invocation:
+
+1. **Receives a trigger** — an Inngest event signaling "evaluate this engagement," "draft this communication," "respond to this chat message," etc.
+2. **Loads the context bundle** for the relevant engagement (Section 8.3).
+3. **Retrieves relevant scars and SOPs** via pgvector on the query signature.
+4. **Calls Claude with structured output** — a Zod schema enforcing the response shape.
+5. **Either proposes an action** (emits `proposal.created` event), **commits a decision** (emits `ai.decision` event for solver), **drafts a communication** (emits `communication.drafted`), or **responds to a chat message** (returns message body to the portal chat endpoint).
+6. **Logs cost and telemetry** (tokens in/out, model used, cache hits, scar matches).
+
+The agent never directly writes to core tables. It emits events. Events drive state changes via workflows. This keeps the agent auditable, reversible, and within the authority layer of the rest of the system.
+
+### 8.3 Context bundle per invocation
+
+A well-formed agent invocation receives:
+
+```typescript
+type OpsAgentContextBundle = {
+  // Target
+  engagement: EngagementRecord;
+  account: AccountRecord | null;
+  contact: ContactRecord;
+  members: AccountMemberRecord[];        // if MMLLC or multi-member
+
+  // Current state
+  solver_report: StatusReport;           // latest from Layer 4
+  recent_events: EventRecord[];          // last 50 events on this engagement/account
+  active_exceptions: ExceptionRecord[];
+
+  // Historical context
+  past_proposals_for_engagement: ProposalRecord[];
+  past_communications_to_contact: CommunicationEventRecord[];
+
+  // Retrieval results
+  relevant_sops: { title: string; excerpt: string; citation: string; }[];
+  relevant_scars: ScarRecord[];          // from v1_scars via pgvector on query signature
+
+  // Policy context
+  applicable_rule_overrides: RuleOverrideRecord[];
+  blast_radius_policy: BlastRadiusPolicy;  // what agent is allowed to auto-execute for this kind of action
+
+  // Request
+  task: {
+    type: 'evaluate_requirement' | 'draft_communication' | 'respond_to_chat' | 'generate_proposal';
+    requirement_key?: string;
+    trigger_event_id: string;
+    additional_context?: Record<string, unknown>;
+  };
+};
+```
+
+The bundle is assembled by `lib/agents/context.ts::buildContextBundle(engagement_id, task)`. It:
+
+1. Parallelizes all reads (Supabase + pgvector).
+2. Uses prompt caching: the context bundle format is stable; the outer prompt template + system instructions are cached, reducing cost by ~60-70% on input tokens on cache hits.
+3. Is bounded in size — recent_events capped at 50, past_proposals capped at 10, relevant_sops/scars capped at 5 each.
+4. Is deterministic given the same engagement state — same inputs produce the same bundle, enabling test replays and cache comparisons.
+
+### 8.4 Retrieval architecture — pgvector
+
+Smart AI uses pgvector (Postgres extension) as the vector store for retrieval over SOPs and the scar index. This avoids adding a new service (Pinecone, Turbopuffer) until volume justifies it.
+
+**Indices:**
+
+```sql
+CREATE TABLE sop_chunks (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  sop_id       UUID NOT NULL,               -- references sop_runbooks from v1 (read-only from Smart AI)
+  section      TEXT NOT NULL,
+  content      TEXT NOT NULL,
+  embedding    VECTOR(1536),                -- OpenAI text-embedding-3-small
+  updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_sop_chunks_embedding ON sop_chunks USING ivfflat (embedding vector_cosine_ops);
+
+CREATE TABLE v1_scars (
+  scar_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  category           TEXT NOT NULL,
+  what_broke_in_v1   TEXT NOT NULL,
+  root_cause         TEXT NOT NULL,
+  evidence_refs      TEXT[] NOT NULL,       -- dev_task IDs, commit SHAs, CLAUDE.md rule refs
+  smart_ai_prevention TEXT NOT NULL,
+  verification_path  TEXT NOT NULL,
+  retrieval_tags     TEXT[] NOT NULL,
+  embedding          VECTOR(1536),          -- on concatenation of retrieval_tags + what_broke_in_v1 + smart_ai_prevention
+  created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  source             TEXT NOT NULL CHECK (source IN ('claude_md_rule','dev_task_bugfix','action_log_anomaly','planning_doc','session_captured'))
+);
+CREATE INDEX idx_v1_scars_embedding ON v1_scars USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX idx_v1_scars_category ON v1_scars(category);
+```
+
+**Retrieval flow:**
+
+1. The agent constructs a *query signature* from the task — typically `task.type + requirement_key + account.entity_type + contact.citizenship` plus any domain-specific tags.
+2. Embed the query signature via OpenAI embeddings (or Claude embeddings when available).
+3. Query pgvector for top-K similar chunks (default K=5 per source, SOPs and scars separately).
+4. Include the retrieved chunks in the context bundle with citations.
+5. The agent's system prompt requires it to cite sources when referencing retrieved content.
+
+**SOP corpus sourcing:** `sop_runbooks` in v1 Supabase is the canonical SOP store (per v1 R060). Smart AI reads from v1 Supabase via a read-only replica connection, chunks the content, and embeds into `sop_chunks` on Smart AI Supabase. Re-embedding runs on a schedule (daily) to pick up SOP edits. No dual-authoring of SOPs — v1 remains the write side.
+
+**Embeddings cost:** negligible. 225 × ~50 SOPs average × chunks × $0.02 per 1M tokens ≈ <$1 per full re-embed. Runs daily.
+
+### 8.5 Structured outputs — preventing hallucination
+
+Every agent response is constrained by a Zod schema. The model is instructed — and technically constrained via Anthropic's tool-use / structured-output API — to produce output that matches the schema. This eliminates the class of failures where the model "invents" a citation or produces malformed JSON.
+
+Example schemas:
+
+```typescript
+// For requirement evaluation
+const aiDecisionSchema = z.object({
+  decision: z.enum(['eligible','not_eligible','requires_human_review']),
+  confidence: z.number().min(0).max(1),
+  reasoning: z.string().min(20),
+  evidence_cited: z.array(z.object({
+    source_type: z.enum(['sop_chunk','scar','event','document']),
+    source_id: z.string(),       // UUID or structured ID
+    excerpt: z.string(),
+  })).min(1),
+  recommendation: z.string(),
+});
+
+// For proposal generation
+const proposalSchema = z.object({
+  action_type: z.enum(['send_reminder','create_invoice','advance_stage','request_document','escalate','draft_communication']),
+  parameters: z.record(z.unknown()),
+  rationale: z.string().min(30),
+  confidence: z.number().min(0).max(1),
+  scar_matches: z.array(z.string()).optional(),
+  blast_radius: z.enum(['client_visible','admin_only','internal_only']),
+  alternative_considered: z.string(),   // R101 enforcement in agent output
+  weakness_acknowledged: z.string(),    // R101 enforcement
+});
+```
+
+The `alternative_considered` and `weakness_acknowledged` fields are R101's five-question discipline embedded in agent output. Every proposal the agent produces includes its own devil's-advocate check — surfaced to the admin reviewing the proposal, so the admin sees not just "what to do" but also "what else was considered" and "how this could be wrong."
+
+### 8.6 Multi-model tiering
+
+The agent routes to different Claude models based on task complexity:
+
+| Task type | Default model | Why |
+|---|---|---|
+| Triage classification (inbound email/message to engagement) | Haiku 4.5 | Fast, cheap, high accuracy on classification |
+| Requirement satisfaction check (solver-triggered) | Haiku 4.5 | Usually a simple lookup with light reasoning |
+| Communication drafting (reminder, status update) | Sonnet 4.6 | Tone matters; needs nuance |
+| Complex rule interpretation (post-September eligibility, treaty-based ITIN) | Opus 4.7 | Reasoning over multiple SOP sections |
+| Client chat response (portal support) | Sonnet 4.6 | Client-facing; tone + accuracy both matter |
+| Exception pattern detection (run weekly, batch) | Opus 4.7 via Batch API | Best reasoning on aggregated data, 50% discount via batch |
+
+Tier selection is per-task, declarative in the agent's dispatch table, not hardcoded in each call site. Overrides possible per spec (a spec can mark a particular `ai_evaluable` requirement as "requires_opus" if the business determines it).
+
+### 8.7 Prompt caching
+
+Anthropic's prompt caching reduces cost on repeated input by up to 90%. Smart AI applies it aggressively:
+
+**Cacheable content (always cached):**
+- System prompt (agent instructions, R101 reminder, structured-output schema).
+- Retrieved SOP chunks (if same chunks recur across invocations, they cache).
+- Applicable rule overrides.
+
+**Non-cacheable content (fresh per invocation):**
+- The specific engagement state, recent events, solver output.
+- The task description.
+
+Practical cost impact: with prompt caching, input token cost drops roughly 60-70% on agent invocations (the system prompt and SOP corpus are large and stable). This is the primary reason estimated cost at 225 clients is $900-$1,400/month rather than $3,000.
+
+### 8.8 Tools available to the agent
+
+The agent has a narrow, typed tool set. Each tool is a TypeScript function exposed via Anthropic's tool-use API. The agent cannot execute arbitrary code — only call these tools.
+
+**Read tools:**
+- `query_events(engagement_id, event_types?, since?)` — fetch events for the target engagement.
+- `query_solver(engagement_id)` — get the latest `StatusReport`.
+- `read_document(document_id)` — fetch a document's metadata + extracted fields (not raw bytes).
+- `get_contact(contact_id)` — fetch contact fields.
+- `get_member(account_id, contact_id)` — fetch membership fields.
+- `search_sops(query)` — pgvector search over SOPs; returns chunks with citations.
+- `search_scars(query)` — pgvector search over v1_scars; returns matching scars with preventions.
+
+**Write tools (all emit events; do not directly mutate entity tables):**
+- `create_proposal(proposal)` — emits `proposal.created`.
+- `draft_communication(draft)` — emits `communication.drafted`.
+- `commit_decision(decision)` — emits `ai.decision` for a requirement (only when task.type = 'evaluate_requirement').
+- `request_exception(exception)` — emits `exception.requested`. Human must approve; agent cannot self-approve.
+- `send_via_safe_send(message, blast_radius_policy)` — escalates to safeSend path (v1 pattern preserved for outbound email, R037).
+
+**Escalation tool:**
+- `escalate_to_human(reason, urgency)` — if the agent cannot produce a confident response, it calls this to hand off. Emits a high-priority proposal or a task.
+
+Tools are the agent's authority boundary. Adding new tools requires code change + review. Tools that mutate client-facing state (send emails, charge cards, change contracts) are fundamentally different from tools that read or propose — and the distinction is enforced at the tool-definition level, not at the prompt level.
+
+### 8.9 Proposal workflow
+
+When the agent generates a proposal:
+
+1. **Emit `proposal.created`** with full payload (action_type, parameters, rationale, confidence, scar_matches, blast_radius, alternative_considered, weakness_acknowledged, evidence_events).
+2. **Blast-radius gating:**
+   - `internal_only` (create a dev_task, file a document, update an internal status): may auto-execute if confidence ≥ threshold AND historical approval rate ≥ threshold AND no scar match vetoes it.
+   - `admin_only` (propose an admin task, surface an insight): always requires human review.
+   - `client_visible` (send an email, create an invoice, charge a card, change a contract): **always** requires human review regardless of confidence or history.
+3. **If auto-execution permitted:** emit `proposal.auto_executed` + trigger the action workflow.
+4. **If human review required:** proposal lands in CRM inbox. Admin approves/rejects via UI. Emits `proposal.approved` or `proposal.rejected`.
+5. **Rejections feed retrieval:** rejected proposals are indexed in pgvector alongside the rejection reason. Future proposals check "have similar proposals been rejected for this engagement or this category?" and either surface the rejection context or self-escalate.
+
+### 8.10 Agent rationale and devil's-advocate flags
+
+**[R101-FLAG on model calibration.]** Claude models — like all LLMs — have known calibration errors. A 0.91 confidence output is not statistically 91% correct. Thresholds tuned on raw confidence will fire incorrectly.
+
+The resolution: the observability stack (Section 18) includes an active calibration plot. For each proposal type, we track `(AI confidence, admin decision)` pairs over time. Every week, we compute the actual accuracy-by-confidence-bucket. If the model reports 0.9+ confidence but actual accuracy is 0.75, we adjust the auto-execution threshold upward until observed accuracy hits the target. Calibration is empirical, not nominal.
+
+**[R101-FLAG on retrieval noise.]** pgvector similarity can return loosely-relevant chunks that the model then treats as authoritative. The agent might cite a scar that is syntactically similar but semantically unrelated.
+
+The resolution: retrieval results include a similarity score. The system prompt instructs the agent: "Only cite retrieval results with similarity ≥ 0.75. For lower similarity results, include them as context but do not cite them as evidence." Additionally, the structured output schema requires `source_id` to be a real UUID the system can validate — if the model invents an ID, the emit fails at Zod validation, and the proposal does not ship.
+
+**[R101-FLAG on single-agent context window saturation.]** At high volume, a single agent processing many engagements per minute may run into Anthropic rate limits or context-window-exhaustion on large context bundles.
+
+The resolution:
+1. **Rate limiting at the Inngest layer:** per-agent concurrency cap (default 10 concurrent invocations), queuing beyond that.
+2. **Context bundle size bounds:** hard-capped at ~30k input tokens. If a bundle exceeds, the agent's context loader summarizes older events before embedding.
+3. **At observed saturation, promote specialist agents:** if the single agent is the bottleneck, split Triage off first (highest volume, simplest model). The architecture supports this without rewiring tools — only the agent dispatch table changes.
+
+**[R101-FLAG on agent self-contradiction across sessions.]** An agent evaluating the same question at two different times might produce different outputs (model non-determinism, different retrieval results).
+
+The resolution:
+1. **Temperature = 0** for all deterministic tasks (requirement evaluation, proposal scoring).
+2. **Cache AI decisions** in the event log. If solver needs a decision and one exists fresh, use it rather than re-invoking.
+3. **Expected divergence** for creative tasks (draft communications, tone review): the diff between two invocations is rejected only if it materially changes business semantics, not if it's rephrased.
+
+**[R101-FLAG on cost runaway.]** If the agent is triggered on every event, and some engagements have hundreds of events per day, costs spike unpredictably.
+
+The resolution: Inngest workflows batch trigger events. Instead of "agent fires on every event," the pattern is "agent fires on an engagement-level signal at most once per hour" — unless the event is high-priority (payment.confirmed, document.uploaded for a blocking requirement). Signal debouncing at the workflow layer. Cost alerting at 80% of monthly cap. Per-invocation cost is logged in the event itself (`ai.decision.payload.tokens_input/output/cost_usd`) for after-the-fact analysis.
+
+---
+
+## 9. v1 Scar Index — The Learning Layer
+
+The v1 Scar Index is the system's institutional memory of past failures, converted into structured guardrails. It is the direct answer to Antonio's observation: **"The smart system should learn from the dumb system using the dev_tasks or similar to see all the bugs and errors and limitations today are in place, to avoid and prevent them."**
+
+### 9.1 Why a scar index is first-class architecture, not a document
+
+A document of "past bugs" is a static artifact that drifts. The scar index is queryable at design time AND at runtime, and it feeds the Ops Agent's context bundle so the agent considers relevant scars in real time when proposing actions.
+
+Without a scar index:
+- Design decisions lose context — "why did we do it this way?" answers are in commit messages a year old.
+- Agent proposals repeat known mistakes — a proposal to auto-send under a pattern that previously caused a client incident would pass undetected.
+- New engineers (or new Claude sessions) re-discover solved problems.
+
+With a scar index:
+- Every design decision is accountable to relevant scars. "Why do we tokenize EIN in events?" — "SC-014: v1 had EIN numbers leak into logs." Checkable, citable.
+- Agent proposals that match a failure pattern escalate automatically.
+- Onboarding to the system is: read this doc + scan the scar index. Fast.
+
+### 9.2 Scar schema
+
+```sql
+CREATE TABLE v1_scars (
+  scar_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  scar_number          TEXT NOT NULL UNIQUE,              -- human-readable: 'SC-001', 'SC-042'
+  category             TEXT NOT NULL,                     -- see §9.3 taxonomy
+  severity             TEXT NOT NULL CHECK (severity IN ('catastrophic','significant','operational','cosmetic')),
+
+  -- What went wrong
+  title                TEXT NOT NULL,                     -- short label
+  what_broke_in_v1     TEXT NOT NULL,                     -- what happened, in prose
+  root_cause           TEXT NOT NULL,                     -- why
+  evidence_refs        JSONB NOT NULL,                    -- structured: { dev_tasks: [...], commits: [...], claude_md_rules: ['R037','R041'], action_log_entries: [...] }
+
+  -- How Smart AI prevents it
+  smart_ai_prevention  TEXT NOT NULL,                     -- the design decision that prevents this
+  prevention_type      TEXT NOT NULL CHECK (prevention_type IN (
+    'schema_constraint','type_invariant','rls_policy','test_case','workflow_gate','agent_retrieval','ui_pattern','none_yet'
+  )),
+  verification_path    TEXT NOT NULL,                     -- how we know the prevention works (test file + line, DB constraint, etc.)
+
+  -- Retrieval
+  retrieval_tags       TEXT[] NOT NULL,                   -- for vector search
+  embedding            VECTOR(1536),
+
+  -- Lifecycle
+  source               TEXT NOT NULL CHECK (source IN (
+    'claude_md_rule','dev_task_bugfix','action_log_anomaly','planning_doc','session_captured','post_cutover_incident'
+  )),
+  extracted_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_validated_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  status               TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','no_longer_applicable'))
+);
+
+CREATE INDEX idx_scars_category ON v1_scars(category);
+CREATE INDEX idx_scars_severity ON v1_scars(severity);
+CREATE INDEX idx_scars_embedding ON v1_scars USING ivfflat (embedding vector_cosine_ops);
+CREATE INDEX idx_scars_active ON v1_scars(scar_number) WHERE status = 'active';
+```
+
+### 9.3 Scar category taxonomy
+
+Scars are categorized so retrieval and auditing are structured. The initial taxonomy:
+
+- **`silent_write`** — state changed without a corresponding event or log. (v1 examples: 176 direct DB writes in the MCP tools pre-audit.)
+- **`race_condition`** — concurrency bug. (v1 example: invoice number collision before R098's partial unique index.)
+- **`rule_as_prose`** — business rule enforced only by prose in CLAUDE.md or SOPs, not by code or DB. (v1 example: R094 leads.status semantics.)
+- **`hardcoded_value`** — string literal in code that should be config. (v1 example: 85 occurrences of `'Tax Return'` / `'Formation'` / etc.)
+- **`pii_leak_risk`** — PII in event payloads, logs, or unscoped RLS. (Mitigated by design in Smart AI; any historical v1 case becomes a scar.)
+- **`webhook_missing_signature`** — webhook endpoint accepts input without verifying signature. (v1: some endpoints; all tightened.)
+- **`email_encoding_issue`** — subject lines rendering as mojibake. (v1 R041.)
+- **`invoice_numbering_issue`** — race, gap, or collision. (v1 R098.)
+- **`ui_error_swallowing`** — client-side fetch errors collapsing into generic toasts. (v1 R099.)
+- **`hard_delete_client_visible`** — admin deletion of content the client has seen, without soft-delete. (v1 R100.)
+- **`multi_machine_git_desync`** — iMac / Mac Mini / MacBook state drift. (v1 R070, R071, R076.)
+- **`placeholder_data_entity`** — creating a real entity with fake data as a workaround. (v1 placeholder-account pattern; solved in Smart AI via `engagements`.)
+- **`assumption_in_action`** — code or prompt acting on an assumed fact. (v1 R093.)
+- **`lazy_plan`** — a plan proposed without devil's-advocate check. (v1 R101.)
+- **`data_quality_drift`** — DB field meanings drift from documented meanings. (v1 example: `accounts.created_at` is import date, not business-relationship start.)
+- **`cross_service_coordination_gap`** — no single place to see all services for a client. (From target-control-model-challenge doc.)
+- **`other`** — catch-all; new categories are added as they emerge.
+
+Every new scar is assigned a category. If none fits, a new category is added — via code change, so new taxonomy members are deliberate.
+
+### 9.4 Population sources and process
+
+The initial ≥50-scar target (Stage 0 S0.9 exit) is populated from:
+
+**Source 1: CLAUDE.md R005-R101 (estimated ~30-50 scars).**
+Each rule in v1 CLAUDE.md's Error-Magnet Rules section is a scar by construction — it was added because something broke or was at risk of breaking. The extraction process:
+
+1. Parse CLAUDE.md R-rules into structured objects (regex on `- **R\d+**`).
+2. For each rule, LLM-assisted extraction of the structured fields: `category`, `title`, `what_broke_in_v1`, `root_cause`, `smart_ai_prevention`, `verification_path`. The LLM is given the rule text + surrounding context.
+3. Human review (Antonio + me) of each extracted scar before insertion.
+4. Insert into `v1_scars` with `source: 'claude_md_rule'`, `evidence_refs: { claude_md_rules: ['R037'] }`, etc.
+
+**Source 2: v1 `dev_tasks` with `type='bugfix'` (estimated 50-200 scars).**
+Every bugfix task has a title, `progress_log` JSONB describing what was done, and often commit SHAs referenced. The extraction:
+
+1. `SELECT * FROM dev_tasks WHERE type = 'bugfix' AND status = 'done'`.
+2. For each task, LLM-assisted extraction of the structured fields, using the task title, description, and progress_log.
+3. Human review.
+4. Insert into `v1_scars` with `source: 'dev_task_bugfix'`, `evidence_refs: { dev_tasks: ['uuid'], commits: ['sha'] }`.
+
+**Source 3: `action_log` anomalies.**
+v1's P2.2 audit surfaced patterns of raw SQL writes bypassing `dbWrite`. Each distinct anti-pattern becomes a scar.
+
+**Source 4: Planning docs in the working tree.**
+Files like `target-control-model-challenge.md`, `sandbox-reality-assessment.md`, `operating-model-assessment.md` already identify failure modes. Each named failure mode becomes a scar if not already captured from another source.
+
+**Source 5: Session-captured scars during Smart AI build.**
+When a reviewer session (multi-session challenge) or a Stage 0/1 build step surfaces a v1 issue worth capturing, it is added to the scar index by the session that discovered it.
+
+**Source 6: Post-cutover incidents.**
+Once v2 is live, any production incident caused by a pattern v2 inherited or failed to prevent becomes a scar. This keeps the index growing and the system learning.
+
+### 9.5 Build-time use — design guardrail
+
+Before any new feature ships in Smart AI:
+
+1. The developer (me, or a future engineer) queries `v1_scars` for categories related to the feature. Example: building the portal chat → query `category IN ('hard_delete_client_visible','rule_as_prose','ui_error_swallowing','pii_leak_risk')`.
+2. For each matching scar, verify the feature's implementation provably prevents it. "Provably" = a DB constraint that would reject the scar's failure case, OR a type invariant, OR a specific test case, OR an RLS policy.
+3. Mark each scar as "prevention verified" in the PR description with a pointer to the prevention evidence.
+4. A reviewer (Antonio or another session) can challenge: "Does this prevention actually prevent the scar?"
+
+If a relevant scar has no preventable mechanism in the current implementation, the feature does not ship. The scar becomes a design gate. This is a real constraint — it slows development — and that's the point. v1's accreted bugs happened because new features shipped without checking whether they re-enacted old mistakes.
+
+### 9.6 Runtime use — agent retrieval
+
+The Ops Agent's context bundle includes scars retrieved via pgvector on the query signature. Process:
+
+1. Compute the query signature from the task (e.g., "proposal to send reminder email for missing document on MMLLC engagement").
+2. Retrieve top-K scars by vector similarity (default K=5).
+3. Include in the agent's system prompt with instructions: "Check whether the proposed action matches any of these known failure patterns. If it does, and the prevention condition is not clearly satisfied in current state, escalate to human review regardless of confidence."
+4. The agent's structured output includes `scar_matches: [scar_numbers]` — every scar it considered and why it was / wasn't a blocker.
+5. On proposal review in the CRM, the admin sees the scar matches and can attack the proposal's reasoning about why it's safe.
+
+### 9.7 Scar maintenance
+
+Scars are not write-once. They are maintained:
+
+- **`status = 'superseded'`** — when a scar is replaced by a more precise version (e.g., a category is refined).
+- **`status = 'no_longer_applicable'`** — when the underlying concern is genuinely resolved and no longer a risk (rare; most scars stay active).
+- **`last_validated_at`** — updated whenever the prevention is re-verified (ideally annually, or when the verification_path changes).
+- **`evidence_refs`** — appended to, never overwritten. If new evidence of the scar surfaces, it gets added.
+
+A weekly cron runs: "For each active scar, is the verification_path still sound?" — it runs the specific check. If a DB constraint was the prevention and the constraint got dropped somehow, the cron alerts.
+
+### 9.8 Scar index rationale and devil's-advocate flags
+
+**[R101-FLAG on LLM-assisted extraction accuracy.]** LLMs extracting structured data from dev_task progress_log text will make mistakes. Hallucinated causes, miscategorized scars, oversimplified root causes.
+
+The resolution: every extracted scar requires human review before insertion. The LLM is a *first draft* assistant, not the authority. Antonio or I look at each proposed scar, edit, approve or reject. The population effort is meaningful — 100+ scars reviewed manually — but it is bounded (done once in Stage 0), and the value is structural.
+
+**[R101-FLAG on scar index bloat.]** If every tiny v1 issue becomes a scar, the index grows huge and retrieval becomes noisy.
+
+The resolution: the `severity` field filters low-signal scars out of default retrieval. Default retrieval includes `severity IN ('catastrophic','significant')`; operational/cosmetic scars are available via explicit query but not part of the agent's default context. The taxonomy is also deliberately coarse — if two scars would end up identical under the category axis, they are merged.
+
+**[R101-FLAG on false prevention claims.]** A developer writes "This feature prevents SC-042" in a PR without actually having evidence. The review passes because no one verifies the prevention claim.
+
+The resolution: `verification_path` is a structured field that must point to a specific artifact — a test file + line number, a DB constraint name, an RLS policy name. The build process (future CI job) verifies that every scar's `verification_path` resolves to a real artifact and that the artifact exists in the current codebase. If a prevention's verification_path is `tests/unit/invoice-number.test.ts:42` and that file or line no longer exists, the CI fails and the scar moves to `status = 'prevention_lost'`.
+
+**[R101-FLAG on retrieval drift as the system evolves.]** v1 scars describe v1 patterns. As Smart AI evolves, the scar index's relevance to Smart AI's own code drifts — Smart AI may produce its own new failure modes that aren't in the v1 index.
+
+The resolution: post-cutover scar-source-6 (post-cutover incidents) explicitly opens the scar index to v2's own learning. Every production incident in v2 becomes a new scar, categorized appropriately. The index is living institutional memory, not a museum of v1 failures.
+
+---
+
+*(Plan continues. Remaining sections: Portal UX, CRM UX, Exception Handling, Business Rules, Security/PII, Claude API, Inngest, Infrastructure, Observability, Build Stages, Migration, Governance, Cost Model, Appendices A-E.)*
