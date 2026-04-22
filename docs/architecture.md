@@ -1,8 +1,8 @@
 # Smart AI TD Operations — Architecture Plan
 
-**Version:** 1.4 — Post-Round 5 adversarial review (final)
-**Date:** 2026-04-22 (v1.4 revision); v1.3 same date; v1.2 same date; v1.1 same date; 2026-04-21 (v1.0)
-**Status:** Pre-build. Five rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
+**Version:** 1.5 — Post-Round 6 adversarial review
+**Date:** 2026-04-22 (v1.5 revision); v1.4 same date; v1.3 same date; v1.2 same date; v1.1 same date; 2026-04-21 (v1.0)
+**Status:** Pre-build. Six rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
 
 ## v1.2 Changelog — What Changed Since v1.0
 
@@ -86,6 +86,19 @@
 | 🟠 F10. Pre-emit PII scrubber (`scrubPayloadForPII`) defined in §14.4 but never called from `withEmit()` | Free-form fields (exception reasons, chat) flow into events unscrubbed; named deleted contacts survive as orphan PII | **Add `const scrubbed = await scrubPayloadForPII(input.event_type, validatedPayload)` between Zod parse and `rpc()` call** |
 | 🟠 F11. Exception-expirer emits `account_id: exc.account_id` but `exceptions` table has no `account_id`; SELECT only fetches `id, engagement_id` | `exc.account_id` is `undefined`; drain's account-channel broadcast skipped; exception expirations never reach CRM account view | **JOIN `engagements` in expirer SELECT to get `account_id`; pass to `withEmit()`** |
 | 🟠 F12. `rule_overrides.effective_from` has no DB-level lower bound; backdated overrides bypass Round 2 Fix A's price-protection guarantee | Admin (or malformed form) setting past `effective_from` retroactively changes contracted prices — the exact failure Fix A was designed to prevent | **Add `CHECK (effective_from >= created_at)` on `rule_overrides`; server-side API rejects backdated values without explicit owner-role override** |
+
+### Round 6 (sixth reviewer, architecture-only): 2 load-bearing flaws + 2 significant
+
+| Flaw | Consequence | Fix |
+|---|---|---|
+| 🔴 R6-F1. `emit_event_atomic` IF/ELSIF ladder has no ELSE clause; unknown `p_entity_table` falls through silently; event is emitted + outbox fires + downstream workflows run — but the DB row was never written. The §5.4 demo example (`table: 'payments'`) is NOT in the ladder and hits this failure on first use. Within supported branches, unknown JSONB keys (e.g., `metadata`) are silently dropped via COALESCE, so callers believing their write landed get no error. `SupportedEntityTable` TS union advertises more tables than the function implements — TypeScript silently accepts the miswire | Event log asserts a state change that the DB never made; downstream Portal renders a row that does not exist; audit trail is corrupted | **Add `ELSE RAISE EXCEPTION 'unsupported entity table %'` after last ELSIF; add per-branch JSONB key whitelist with RAISE on unknown keys; fix `payments` example (emit_event_atomic handles UPDATE not INSERT; payments step uses direct Supabase insert + event-only withEmit); add CI assertion that `SupportedEntityTable` matches the function's ladder** |
+| 🔴 R6-F2. `computeEvalContextFingerprint` has `account_id: '...'` literal placeholder; `members` is always `[]`; member additions never perturb the fingerprint; Inngest dedupes the dispatch; per-member requirements for new members are silently never evaluated for up to 5 minutes (throttle window). Structural defect: all four queries run concurrently but `account_id` comes from `engagements` — the parallel fetch cannot resolve before `members` needs it. Also: `member.added` events have `subject_type='account'` (§5.3), not `subject_type='engagement'`, so the `maxEvent` scan on `subject_id = engagementId` misses member events entirely | Member fingerprint permanently dead; Round 5 F3's 24h-staleness fix fails for member changes; the cost-control throttle relies on fingerprint changes to allow new dispatches | **Sequence reads: fetch engagement first (account_id + spec_version), then run members/maxEvent/exceptions in parallel; include `account_id` in maxEvent subject_id scan; guard null account_id (pre-formation)** |
+| 🟠 R6-F3. `solver_cache.valid_until` is nullable; read predicate `valid_until > now()` evaluates to NULL (not TRUE) for non-TTL rows; cache never hits for any requirement without a TTL (i.e., most requirements). SLO "Solver solve() call (p95) < 500ms with cache hit" is structurally unreachable | Every portal page load, every CRM render, every Inngest step re-runs full solver from scratch; cache is written but never read; performance SLO cannot be met | **Change `valid_until` to `NOT NULL DEFAULT 'infinity'::timestamptz`; predicate `valid_until > now()` now correctly returns TRUE for infinity rows; invalidator `SET valid_until = now()` correctly expires rows; remove partial index WHERE clause** |
+| 🟠 R6-F4. `claim_outbox_batch` RPC is called by the outbox drain but never defined anywhere in the 5,026-line document; the concurrent-claim semantics (FOR UPDATE SKIP LOCKED), the `locked_at` / `locked_by` columns, and the reaper for stuck `publishing` rows are all referenced in prose but have no implementation | Without `FOR UPDATE SKIP LOCKED`, concurrent primary + fallback drain claims the same rows; duplicate Inngest runs + duplicate Realtime broadcasts; outbox rows never transition correctly through `pending → publishing → published`; stuck `publishing` rows accumulate indefinitely | **Define `claim_outbox_batch(p_limit INT)` SQL function with UPDATE … SET status='publishing', locked_at, locked_by … WHERE id IN (SELECT id FROM outbox WHERE status='pending' FOR UPDATE SKIP LOCKED); define reaper cron for stuck `publishing` rows; REVOKE/GRANT to service_role** |
+
+### What v1.5 adds by way of scar protection
+
+Every Round 6 flaw is a scar: silent table-ladder fall-through (event log vs DB split-brain), per-branch field whitelist missing (silent dropped writes), example code using an unsupported table, context-fingerprint function with literal placeholder, structural parallelism defect hiding sequential data dependency, three-valued logic failure on nullable TTL column, and referenced-but-undefined SQL function (same class as Round 5 F6). Future designs check against these before shipping.
 
 ### What v1.4 adds by way of scar protection
 
@@ -749,12 +762,53 @@ export const outboxDrain = inngest.createFunction(
 );
 ```
 
+**`claim_outbox_batch` — DEFINED v1.5 (🟠 R6-F4: called by drain but never defined):**
+
+```sql
+-- Claims a batch of pending outbox rows atomically using FOR UPDATE SKIP LOCKED.
+-- Multiple concurrent drain workers (primary Inngest + fallback Vercel cron) can run safely:
+-- each claims a disjoint set of rows. No two workers process the same row.
+CREATE OR REPLACE FUNCTION claim_outbox_batch(p_limit INT DEFAULT 100)
+RETURNS SETOF outbox
+LANGUAGE plpgsql
+SECURITY DEFINER AS $$
+BEGIN
+  RETURN QUERY
+  UPDATE outbox
+  SET
+    status     = 'publishing',
+    locked_at  = now(),
+    locked_by  = pg_backend_pid()::text  -- unique per connection, sufficient for diagnostic tracking
+  WHERE id IN (
+    SELECT id
+    FROM outbox
+    WHERE status = 'pending'
+    ORDER BY created_at ASC
+    LIMIT p_limit
+    FOR UPDATE SKIP LOCKED  -- skip rows locked by another concurrent worker; no waits, no deadlocks
+  )
+  RETURNING *;
+END;
+$$;
+
+REVOKE EXECUTE ON FUNCTION claim_outbox_batch(INT) FROM PUBLIC, anon, authenticated;
+GRANT  EXECUTE ON FUNCTION claim_outbox_batch(INT) TO service_role;
+
+-- Reaper: unstick rows whose drain worker crashed mid-batch.
+-- A row stuck in 'publishing' for > 60s means the worker died without marking it published.
+-- The reaper runs on the Vercel fallback cron (every 60s) BEFORE claiming new rows:
+--   UPDATE outbox SET status = 'pending', locked_at = NULL, locked_by = NULL
+--   WHERE status = 'publishing' AND locked_at < now() - interval '60 seconds';
+-- This is intentionally a plain UPDATE (not a function) — the cron issues it directly.
+-- The 60s window matches the Vercel cron interval so a stuck row is always recovered within 120s.
+```
+
 **Why this matters:**
 
 - **No silent writes.** If a state change happens but `emit()` fails, the outer transaction rolls back. If `emit()` succeeds but the publish fails, the event still exists and will eventually publish; downstream workflows still fire.
 - **No silent duplications.** `idempotency_key` on `events` blocks duplicate emits. A webhook that fires twice (Stripe famously retries on ACK timeouts) produces at most one event.
 - **Natural backpressure.** If the publisher falls behind (Inngest rate limit, Supabase Realtime connection issue), the outbox queue grows. A monitoring alert fires when depth exceeds threshold. The system degrades visibly, not silently.
-- **Recoverable.** If the drain worker crashes mid-batch, `locked_at` releases on restart (via a separate reaper cron), and pending rows republish. No lost events.
+- **Recoverable.** If the drain worker crashes mid-batch, `locked_at` releases on restart (via the reaper UPDATE above), and pending rows republish. No lost events.
 
 **This pattern is not invented.** It is a well-known pattern, documented by Microsoft, AWS, GoCardless, and countless others. Smart AI uses it because atomicity between storage and message bus is the single most common source of silent data loss in event-sourced systems, and the outbox is the proven fix.
 
@@ -878,20 +932,49 @@ BEGIN
 
   -- 2. Apply entity update (supported tables only — no dynamic SQL for security).
   --    Only reached if no existing idempotency key found above.
+  --
+  --    IMPORTANT — two enforcement layers (🔴 R6-F1):
+  --    (a) ELSE clause: any p_entity_table not in this ladder raises immediately. Without ELSE,
+  --        the function falls through silently, emits the event, fires the outbox — but the DB
+  --        row was never touched. Downstream workflows run on a state change that never happened.
+  --    (b) Per-branch field whitelist: unknown JSONB keys are rejected with RAISE, not silently
+  --        dropped by COALESCE. A caller passing {metadata: {...}} to the engagements branch got
+  --        zero rows updated in v1.4 with no error — the event still fired.
+  --    SupportedEntityTable in lib/events/emit.ts MUST match this ladder exactly.
+  --    CI assertion: scripts/assert-entity-table-sync.ts fails build if they diverge.
   IF p_entity_table IS NOT NULL THEN
     IF p_entity_table = 'engagements' THEN
+      -- Whitelist: only these fields are accepted. Add fields here AND in emit.ts types together.
+      IF (p_entity_update - ARRAY['status', 'started_at', 'completed_at']) <> '{}'::jsonb THEN
+        RAISE EXCEPTION
+          'emit_event_atomic: unsupported engagements field(s): %. Add to whitelist.',
+          (p_entity_update - ARRAY['status', 'started_at', 'completed_at'])::text;
+      END IF;
       UPDATE engagements
       SET status       = COALESCE((p_entity_update->>'status'), status),
           started_at   = COALESCE((p_entity_update->>'started_at')::TIMESTAMPTZ, started_at),
           completed_at = COALESCE((p_entity_update->>'completed_at')::TIMESTAMPTZ, completed_at)
       WHERE id = p_entity_pk;
     ELSIF p_entity_table = 'exceptions' THEN
+      IF (p_entity_update - ARRAY['status', 'expired_at']) <> '{}'::jsonb THEN
+        RAISE EXCEPTION
+          'emit_event_atomic: unsupported exceptions field(s): %. Add to whitelist.',
+          (p_entity_update - ARRAY['status', 'expired_at'])::text;
+      END IF;
       UPDATE exceptions
       SET status     = COALESCE((p_entity_update->>'status'), status),
           expired_at = COALESCE((p_entity_update->>'expired_at')::TIMESTAMPTZ, expired_at)
       WHERE id = p_entity_pk;
     -- ELSIF p_entity_table = 'service_deliveries' THEN ...
     -- Additional tables registered here as Stage 0+ schemas are built.
+    -- Each branch: add field whitelist CHECK before the UPDATE, same pattern as above.
+    ELSE
+      -- Unknown table: abort immediately. Do NOT fall through.
+      -- Falling through would emit an event claiming a state change the DB never made.
+      -- Add a branch above, add the field whitelist, then regenerate SupportedEntityTable.
+      RAISE EXCEPTION
+        'emit_event_atomic: unsupported entity table "%". Add a branch to this function and update SupportedEntityTable in lib/events/emit.ts.',
+        p_entity_table;
     END IF;
   END IF;
 
@@ -933,8 +1016,16 @@ The JS wrapper validates before calling:
 ```typescript
 // lib/events/emit.ts — ONLY public export is withEmit()
 
+// SupportedEntityTable MUST match the IF/ELSIF ladder in emit_event_atomic() exactly.
+// CI assertion: scripts/assert-entity-table-sync.ts compares this union against the
+// plpgsql source. Build fails if they diverge. Adding a new table requires:
+// (1) add ELSIF branch + field whitelist in emit_event_atomic,
+// (2) add the table name here,
+// (3) re-run the CI assertion script.
+export type SupportedEntityTable = 'engagements' | 'exceptions';  // extend as branches are added
+
 export type EntityWrite = {
-  table: SupportedEntityTable;   // 'engagements' | 'exceptions' | 'service_deliveries' | ...
+  table: SupportedEntityTable;
   pk: string;
   update: Record<string, unknown>;
 };
@@ -1038,16 +1129,35 @@ export const paymentConfirmedFlow = inngest.createFunction(
       });
     });
 
-    // Step 2: generate invoice (invoice insert + event, atomic)
+    // Step 2: generate invoice.
+    // emit_event_atomic handles entity UPDATES (state transitions on existing rows), not INSERTS.
+    // Creating a new payments row is a direct Supabase INSERT inside the Inngest step.
+    // Retry idempotency: unique constraint on payments(engagement_id, invoice_type) prevents
+    // duplicate inserts on step retry; withEmit idempotency_key prevents duplicate events.
+    // 🔴 R6-F1: the v1.4 example incorrectly passed table:'payments' to entityWrite.
+    // 'payments' is not in the emit_event_atomic ladder — that call would now RAISE EXCEPTION.
     await step.run('generate-invoice', async () => {
+      // Direct INSERT — not through withEmit (emit_event_atomic is UPDATE-only)
+      const { data: invoice, error: insertErr } = await supabaseAdmin
+        .from('payments')
+        .insert({
+          engagement_id: event.data.engagement_id,
+          account_id: event.data.account_id,
+          /* other invoice fields */
+        })
+        .select('id')
+        .single();
+      if (insertErr) throw insertErr;
+
+      // Event emission with no entityWrite — the payments row is already committed above.
+      // p_entity_table = NULL: emit_event_atomic skips the entity-update branch entirely.
       await withEmit({
-        entityWrite: { table: 'payments', pk: newInvoiceId, update: { /* invoice fields */ } },
         event_type: 'payment.invoice_generated',
         actor_type: 'inngest',
         subject_type: 'engagement',
         subject_id: event.data.engagement_id,
         account_id: event.data.account_id,
-        payload: { invoice_id: newInvoiceId },
+        payload: { invoice_id: invoice.id },
         idempotency_key: `inngest:invoice:${event.data.engagement_id}`,
       });
     });
@@ -1106,14 +1216,63 @@ export function agentEvalIdempotencyKey(
 /**
  * Compute the context fingerprint for an engagement's ai_evaluable requirement.
  * Called immediately before dispatch; any state change produces a new fingerprint.
+ *
+ * REVISED v1.5 (🔴 R6-F2):
+ * v1.4 issued all four queries concurrently via Promise.all, but account_id lives on
+ * engagements — the members query cannot resolve without it. Concurrent issue meant
+ * account_id: '...' placeholder was used, making members always [] and the fingerprint
+ * permanently member-insensitive (member additions never changed the fingerprint).
+ *
+ * Also fixed: member.added events have subject_type='account' (§5.3), so scanning
+ * subject_id = engagementId only missed them. The maxEvent scan now includes account_id
+ * so account-scoped events (member.added, member.removed) move the fingerprint.
  */
 export async function computeEvalContextFingerprint(engagementId: string): Promise<string> {
-  const [members, maxEvent, exceptions, engagement] = await Promise.all([
-    db.account_members.findMany({ where: { account_id: '...', left_at: null }, select: { contact_id: true } }),
-    db.events.aggregate({ _max: { id: true }, where: { subject_id: engagementId } }),
-    db.exceptions.findMany({ where: { engagement_id: engagementId, status: 'active' }, select: { id: true } }),
-    db.engagements.findUnique({ where: { id: engagementId }, select: { spec_version: true } }),
+  // Step 1: fetch engagement to get account_id and spec_version.
+  // Cannot parallelize: the remaining three queries depend on account_id.
+  const engagement = await db.engagements.findUnique({
+    where: { id: engagementId },
+    select: { account_id: true, spec_version: true },
+  });
+  if (!engagement) {
+    throw new Error(`computeEvalContextFingerprint: engagement not found: ${engagementId}`);
+  }
+
+  // Step 2: fetch members, events, exceptions in parallel using the resolved account_id.
+  const [members, maxEvent, exceptions] = await Promise.all([
+    // Members: use real account_id now available.
+    // If account_id is null (pre-formation engagement), members list is empty — correct,
+    // because no account_members rows can exist for a null account yet.
+    engagement.account_id
+      ? db.account_members.findMany({
+          where: { account_id: engagement.account_id, left_at: null },
+          select: { contact_id: true },
+        })
+      : Promise.resolve([]),
+
+    // Events: scan both engagement-scoped AND account-scoped subject IDs.
+    // member.added / member.removed have subject_type='account' (per §5.3 event catalog),
+    // so subject_id = account_id for those events — not engagementId. Scanning only
+    // engagementId missed all member lifecycle events, leaving the fingerprint stale
+    // across member changes and reintroducing the 24h dispatch-dedup failure.
+    db.events.aggregate({
+      _max: { id: true },
+      where: {
+        subject_id: {
+          in: [
+            engagementId,
+            ...(engagement.account_id ? [engagement.account_id] : []),
+          ],
+        },
+      },
+    }),
+
+    db.exceptions.findMany({
+      where: { engagement_id: engagementId, status: 'active' },
+      select: { id: true },
+    }),
   ]);
+
   const raw = [
     members.map(m => m.contact_id).sort().join(','),
     maxEvent._max.id ?? '0',
@@ -1779,10 +1938,19 @@ CREATE TABLE solver_cache (
   status_report    JSONB NOT NULL,
   input_hash       TEXT NOT NULL,               -- hash of (spec_version, override_set_hash_at_engagement_pin_date, last_event_id_for_subject, active_exceptions_hash)
   computed_at      TIMESTAMPTZ NOT NULL,
-  valid_until      TIMESTAMPTZ                  -- optional TTL for time-dependent requirements
+  -- REVISED v1.5 (🟠 R6-F3): was nullable TIMESTAMPTZ.
+  -- NULL > now() evaluates to NULL in Postgres (three-valued logic), not TRUE.
+  -- Every non-TTL row (most requirements) produced a cache miss on every read.
+  -- The SLO "p95 < 500ms with cache hit" was structurally unreachable.
+  -- Fix: NOT NULL DEFAULT 'infinity' is the sentinel for "no TTL".
+  -- infinity > now() is always TRUE — non-TTL rows always hit the cache until invalidated.
+  -- The invalidator SET valid_until = now() correctly expires both TTL and non-TTL rows:
+  -- now() > now() at a later read time is FALSE, so the row is re-computed on next access.
+  valid_until      TIMESTAMPTZ NOT NULL DEFAULT 'infinity'::timestamptz
 );
 
-CREATE INDEX idx_solver_cache_valid ON solver_cache(valid_until) WHERE valid_until IS NOT NULL;
+-- Index covers all rows (no WHERE clause needed — column is NOT NULL now).
+CREATE INDEX idx_solver_cache_valid ON solver_cache(valid_until);
 ```
 
 #### Cross-engagement invalidation walks the dependency graph (v1.1)
@@ -1833,7 +2001,8 @@ The query is indexed. At 100 events/sec with typical dependency graphs (~2-3 dep
 On solve request:
 1. Compute current `input_hash` (includes override_set_hash filtered by engagement's pin_date).
 2. Check cache: if `engagement_id` row exists AND `input_hash` matches AND `valid_until > now()`, return cached `status_report`.
-3. Else, compute fresh. Write to cache. Return.
+   — `valid_until` is `NOT NULL DEFAULT 'infinity'` (v1.5 fix). Non-TTL rows have `valid_until = 'infinity'`; `infinity > now()` is always TRUE. Invalidated rows have `valid_until = now()` at write time; at any subsequent read time, `valid_until > now()` is FALSE. No NULLs — predicate is two-valued, not three-valued.
+3. Else, compute fresh. Write to cache with `valid_until = 'infinity'` (or a spec-specific TTL for time-dependent requirements). Return.
 
 Cache fills gradually under load. First-request latency is unchanged; subsequent reads are O(1) until invalidation.
 
