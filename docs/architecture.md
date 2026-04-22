@@ -349,17 +349,18 @@ The entity graph holds the facts about who exists, what exists, and how they rel
 
 ### 4.1 Core entities
 
-**`contacts` (people).** Every person in the system: clients, members, spouses, partners, signers. Each contact has:
-- Personal attributes: `full_name`, `first_name`, `last_name`, `email`, `email_2`, `phone`, `phone_2`, `language`, `preferred_channel`.
-- Identity: `citizenship`, `residency`, `date_of_birth`, `gender`.
-- Documents (tokenized, raw values live in `sensitive_data` — Section 14): `passport_on_file` (boolean), `passport_expiry_date`, `passport_number_token` (references `sensitive_data`), `itin_number_token`, `itin_issue_date`, `itin_renewal_date`.
-- Address: `address_line1`, `address_city`, `address_state`, `address_zip`, `address_country`.
-- Portal: `portal_tier` (text — `none` | `onboarding` | `active` | `suspended`), `portal_email_sent_at`, `portal_email_template`, `portal_role`, `kyc_status`.
-- Referral: `referrer_type`, `referral_code`.
-- Relationships: `primary_company_id` (weak signal for "which company is this contact most associated with" — authoritative member link lives in `account_members`).
-- Audit: `created_at`, `updated_at`.
-- QuickBooks: `qb_customer_id` (for eventual manual QB sync, R097).
-- Test flag: `is_test` (boolean — keeps QA accounts out of production queries).
+**`contacts` (people) — REVISED v1.1 (names, emails, phones, DOB, address tokenized per 🔴 Fix B).** Every person in the system: clients, members, spouses, partners, signers. Each contact has:
+- **Identity tokens** (raw values live in `sensitive_data` — Section 14): `name_token` (resolves to full legal name, first name, last name), `email_token`, `email_2_token` (nullable), `phone_token` (nullable), `phone_2_token` (nullable), `dob_token`, `address_token`.
+- **Non-PII attributes** (stored in plaintext — not identifying in isolation): `citizenship`, `residency`, `gender`, `language`, `preferred_channel`.
+- **Document status** (boolean flags for quick solver access; raw values tokenized): `passport_on_file` (boolean), `passport_expiry_date`, `passport_number_token` (references `sensitive_data`), `itin_number_token`, `itin_issue_date`, `itin_renewal_date`.
+- **Portal**: `portal_tier` (text — `none` | `onboarding` | `active` | `suspended`), `portal_email_sent_at`, `portal_email_template`, `portal_role`, `kyc_status`.
+- **Referral**: `referrer_type`, `referral_code`.
+- **Relationships**: `primary_company_id` (weak signal for "which company is this contact most associated with" — authoritative member link lives in `account_members`).
+- **Audit**: `created_at`, `updated_at`.
+- **QuickBooks**: `qb_customer_id` (for eventual manual QB sync, R097).
+- **Test flag**: `is_test` (boolean — keeps QA accounts out of production queries).
+
+**Tokenization consequence:** the `contacts` table has no raw names, emails, phone numbers, addresses, or dates of birth. Any operation requiring those values resolves through `sensitive_data` via the token. The solver, agent context bundle, and event payloads all operate on tokens. The CRM and portal UIs resolve to display values at render time. GDPR deletion is structurally complete: nulling a `sensitive_data` row renders every field that referenced its token permanently opaque, across all events and logs. See Section 14.1 for the full tokenization model.
 
 **`accounts` (companies).** Every company: LLCs, corporations, DBAs. Each account has:
 - Identity: `company_name`, `entity_type` (enum — `Single Member LLC` | `Multi Member LLC` | `C-Corp Elected` | more as added), `ein_number_token` (references `sensitive_data`), `state_of_formation`, `formation_date`, `filing_id`.
@@ -473,6 +474,40 @@ These are entities that attach to accounts, contacts, or engagements but are not
 
 **`leads`** — pre-contact funnel entities. Someone who inquired but hasn't signed. State machine: `New` → `Qualified` → `Offer Sent` → `Converted` (per v1 R094: `Converted` means PAYMENT confirmed, not offer signed). Ports forward with R094 semantics preserved — in v2 we have both the `leads` table for funnel tracking and an event `lead.converted` on the event log, so downstream consumers don't depend on column state alone.
 
+**`account_case` (compound per-account state projection) — REVISED v1.1 (🟠 Fix H: hybrid update strategy).** A read-optimized projection table that answers "what's happening with this account right now across all services" without querying every engagement on every dashboard render. This is not a source of truth — the event log and solver are. It is a pre-aggregated view maintained by event handlers and scheduled jobs.
+
+```sql
+CREATE TABLE account_case (
+  account_id              UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+  current_phase           TEXT,             -- e.g., 'formation', 'onboarding', 'tax_season', 'steady_state'
+  priority_focus          TEXT,             -- free-text slug of what most needs attention
+  open_blocker_count      INTEGER NOT NULL DEFAULT 0,    -- incremental
+  open_exception_count    INTEGER NOT NULL DEFAULT 0,    -- incremental
+  active_engagement_count INTEGER NOT NULL DEFAULT 0,    -- incremental
+  next_critical_deadline  TIMESTAMPTZ,                   -- scheduled recompute only
+  health_signal           TEXT CHECK (health_signal IN ('green','yellow','red','unknown')) DEFAULT 'unknown',
+  last_solver_run_at      TIMESTAMPTZ,
+  last_updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  recompute_requested_at  TIMESTAMPTZ                    -- set when a lifecycle event requests full recompute
+);
+```
+
+**Field-level update rules (the "hybrid" in Fix H):**
+
+| Field | Update strategy | Trigger |
+|---|---|---|
+| `open_blocker_count` | Incremental delta | `requirement.status_changed` → blocked / unblocked |
+| `open_exception_count` | Incremental delta | `exception.approved` / `exception.revoked` |
+| `active_engagement_count` | Incremental delta | `engagement.created` / `engagement.completed` / `engagement.cancelled` |
+| `next_critical_deadline` | Scheduled recompute | `engagement.status_changed`, `deadline.updated` — triggers Inngest recompute job |
+| `current_phase` | Full recompute | Inngest job on `account_case.recompute_requested` event |
+| `priority_focus` | Full recompute | Same Inngest job |
+| `health_signal` | Full recompute | Same Inngest job |
+
+**Rationale for hybrid over pure incremental or pure scheduled:** pure incremental collapses when events arrive out of order (which they do, under load). Pure scheduled recompute on all fields creates a hot query at each run. The hybrid separates cheap counter fields (safe for increment/decrement) from compound judgment fields (`current_phase`, `priority_focus`, `health_signal`) that require cross-engagement context. The expensive recompute runs on lifecycle events only (not on every emit), bounding the job frequency to O(engagement transitions), not O(events).
+
+**Stale-read guarantee:** `last_updated_at` is visible on the CRM Intelligence Dashboard. If an admin sees a stale timestamp, they can manually trigger recompute. The dashboard never presents `account_case` data without surfacing its freshness.
+
 ### 4.3 What the entity graph does NOT include
 
 - **AI-specific tables** (agent memory, proposals, conversations) — those live in the Ops Agent layer (Section 8).
@@ -497,15 +532,16 @@ RLS policies are designed upfront, before the first `emit()` call, before the fi
 
 ### 4.5 Entity graph rationale and devil's-advocate flags
 
-**[R101-FLAG on engagements vs case-centric model.]** The 2026-04-18 `target-control-model-challenge.md` in the v1 working tree argued that the missing layer is not per-engagement but per-client-case — a client-centric aggregate that names "what's happening with Juan's Delaware LLC right now across all services." The challenge doc's recommendation was to grow the `accounts` table with case-level fields (`current_phase`, `priority_focus`, `open_exception_count`).
+**[R101-FLAG on engagements vs case-centric model — RESOLVED in v1.1.]** The 2026-04-18 `target-control-model-challenge.md` argued that the missing layer is a per-client-case aggregate — a client-centric view naming "what's happening with this account across all services right now." The Round 2 reviewer (🟠 Fix H) confirmed: pure render-time composition from solver output is insufficient once compound state must drive *operational decisions* (which reminder to send when blockers overlap, what the agent's priority_focus should be). Without pre-computed compound state, every decision logic that spans engagements must re-query every engagement at decision time — a query-time bottleneck at scale, and an agent context complexity problem.
 
-This plan chose `engagements` over `accounts.case_state` because: (a) engagements are commercial contracts, they have contracts, prices, statuses, and lifecycles that an `accounts.case_state` column set does not capture, and (b) a single account can have multiple engagements over time (Formation → Onboarding → Tax Return → Renewal → Closure), and denormalizing all of their state into `accounts` collapses time.
+**Decision (v1.1):** add `account_case` projection table (defined in Section 4.2 above). `account_case` is a pre-aggregated read-model, not a source of truth. It answers compound questions fast while the event log and solver remain the canonical layers.
 
-**The open question for external challenge:** is the solver's "per-engagement status report" enough to answer the compound question "what's happening with this client across all services?" or do we need a per-account case aggregate on top of per-engagement solver output?
+**Why both engagements AND account_case rather than one or the other:**
+- `engagements` are commercial contracts with version-pinned prices, lifecycles, and explicit statuses — they are the right home for commercial truth.
+- `account_case` is a cross-engagement summary for operational dispatch — it answers "what's happening with this client right now" without querying every engagement on every render.
+- They are complementary: one per commercial contract (many per account over time), one per account (always exactly one, always fresh).
 
-This plan's current answer: the CRM Client 360 view (Section 11) composes solver output across all engagements for a given account and renders the compound view. Compound state is a *render* concern, not a storage concern. If that answer breaks at 1,000 clients, we add a materialized `account_case_state` view at that point. Starting with storage denormalization before rendering proves it is needed is premature.
-
-A reviewer session should attack this specifically: is per-engagement + render-time composition genuinely sufficient, or are there operational decisions (which reminder to send when there are overlapping blockers across engagements, priority focus across services) that require pre-computed compound state?
+**What this closes:** the agent's priority_focus query, the Intelligence Dashboard's per-account health signal, and the dunning/reminder trigger logic can all read from `account_case` first (fast, single row). Only when inspecting a specific engagement does the agent query engagement-level solver output. This is the right decomposition for both query performance and agent context size.
 
 ---
 
@@ -632,7 +668,7 @@ Events are organized by domain. The catalog below is the first-cutover set (Stag
 - `engagement.started` — work begins. Payload: `{ trigger: 'payment_confirmed' | 'wizard_completed' | 'admin_manual' }`.
 - `engagement.paused` — engagement temporarily held. Payload: `{ reason, paused_by }`.
 - `engagement.resumed` — payload: `{ resumed_by }`.
-- `engagement.completed` — engagement finished. Payload: `{ completion_type: 'full' | 'partial' | 'cancelled' }`.
+- `engagement.completed` — **REVISED v1.1 (🟡 Fix J: precise emission condition).** Emitted when ALL of the following are true simultaneously: (a) all `required` requirements in the engagement's effective spec report `satisfied` or `satisfied_by_exception`, AND (b) `engagements.completed_at` is set to `now()`, AND (c) the solver confirms `overall_progress = 1.0`. This event is NOT emitted on cancellation (that fires `engagement.cancelled`) and NOT emitted on partial completion (partial is a state change, not a final event). The Zod schema for this event enforces the precondition: `{ completion_type: 'full' | 'exception_assisted', completed_requirement_count: number, spec_version: number }`. Any attempt to emit `engagement.completed` without `completion_type` and `completed_requirement_count` fails Zod validation before the outbox insert. Auto-execute threshold for agent: never — this event is emitted by the workflow after the admin confirms all requirements are satisfied, not by the agent autonomously.
 - `engagement.cancelled` — payload: `{ cancellation_reason, cancelled_by, refund_amount }`.
 
 **Account lifecycle:**
@@ -926,9 +962,10 @@ export const smllcFormation = defineSpec({
     blocked_on_ein: { escalate_to_admin_after_days: 21 },
   },
   exceptions_config: {
-    'member_proof_of_address': { overridable_by: ['antonio','luca'], requires_reason: true },
-    'member_passport': { overridable_by: ['antonio'], requires_reason: true, requires_alternative_document: true },
-    'ein': { overridable_by: ['antonio'], requires_reason: true, note: 'EIN is legally required; override must include alternative evidence' },
+    // REVISED v1.1 (🟠 Fix G): roles, not usernames — 'antonio' / 'luca' become 'owner' / 'admin'
+    'member_proof_of_address': { overridable_by_roles: ['owner', 'admin'], requires_reason: true },
+    'member_passport': { overridable_by_roles: ['owner'], requires_reason: true, requires_alternative_document: true },
+    'ein': { overridable_by_roles: ['owner'], requires_reason: true, note: 'EIN is legally required; override must include alternative evidence' },
   },
 });
 ```
@@ -961,7 +998,7 @@ CREATE INDEX idx_service_specs_active ON service_specs(service_type, version) WH
 
 Each engagement pins to a specific `(service_type, version)` at creation (`engagements.spec_id`, `engagements.spec_version`). When the spec is edited and a new version is seeded, existing engagements keep their pinned version; new engagements use the new version.
 
-### 6.3 The rule override layer
+### 6.3 The rule override layer — REVISED v1.1 (🔴 Fix A: pin_date; 🟠 Fix G: user_roles; 🟡 Fix N: spec_version_warnings)
 
 Some values in a spec are inherently variable — pricing, reminder cadences, grace periods, exception configurations. Antonio wants to edit these without a deploy. The `rule_overrides` table is where runtime edits live:
 
@@ -972,9 +1009,9 @@ CREATE TABLE rule_overrides (
   rule_path       TEXT NOT NULL,                  -- JSON path into the spec, e.g., 'pricing_rules.base_price_usd'
   override_value  JSONB NOT NULL,
   reason          TEXT NOT NULL,                  -- why this override exists
-  created_by      UUID NOT NULL,                  -- auth.users.id
+  created_by      UUID NOT NULL REFERENCES auth.users(id),
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  effective_from  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  effective_from  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- KEY: engagements created before this date do NOT see this override
   effective_to    TIMESTAMPTZ,                    -- NULL = indefinite
   active          BOOLEAN NOT NULL DEFAULT true
 );
@@ -982,21 +1019,142 @@ CREATE TABLE rule_overrides (
 CREATE INDEX idx_rule_overrides_active ON rule_overrides(spec_id, rule_path) WHERE active = true;
 ```
 
-At spec-resolution time, the effective spec is computed as: `spec_json` from `service_specs` deep-merged with active `rule_overrides` for that spec. The solver, the agent, and the CRM all call `resolveSpec(spec_id)` which returns the effective spec.
+**🔴 Fix A — `resolveSpec()` takes a `pin_date` parameter.** This is the mechanism that prevents rule overrides from retroactively mutating contracted prices on existing engagements:
+
+```typescript
+// lib/specs/resolver.ts
+/**
+ * Resolve the effective spec for a given spec_id as of a specific date.
+ * Engagements MUST pass their own created_at as pin_date.
+ * The CRM spec preview (what-if) passes null for pin_date (shows current effective spec).
+ */
+export async function resolveSpec(
+  specId: string,
+  pinDate?: Date | null,          // null = "as of now", used for preview and new engagements
+): Promise<EffectiveSpec> {
+  const [spec, overrides] = await Promise.all([
+    db.service_specs.findUnique({ where: { id: specId } }),
+    db.rule_overrides.findMany({
+      where: {
+        spec_id: specId,
+        active: true,
+        effective_from: { lte: pinDate ?? new Date() },  // 🔴 Fix A: override must predate engagement creation
+        OR: [
+          { effective_to: null },
+          { effective_to: { gte: pinDate ?? new Date() } },
+        ],
+      },
+    }),
+  ]);
+  return deepMergeOverrides(spec.spec_json, overrides);
+}
+
+// Usage by solver (always pin to engagement creation date):
+const effectiveSpec = await resolveSpec(engagement.spec_id, engagement.created_at);
+
+// Usage by CRM "what-if" preview (unpinned — shows current effective spec):
+const previewSpec = await resolveSpec(specId, null);
+```
+
+**How this closes 🔴 Flaw A:** if Antonio raises MMLLC pricing by $200 today, `effective_from = now()`. An engagement created last month passes `pin_date = engagement.created_at` (last month). That pin_date is before `effective_from`, so the override is excluded. The old engagement keeps its contracted price. A new engagement created tomorrow sees the new price. The pricing mutation is forward-only. Contracted prices are immutable.
+
+**CRM UI enforcement:** when creating a pricing override, the Spec Editor warns: "This override will apply to new engagements created after [effective_from]. Existing engagements are unaffected." If Antonio explicitly wants to apply a change to an existing engagement (rare — e.g., a corrective amendment), he uses the engagement-level override path (directly patching the engagement's `contracted_price` with a reason and an event emitted).
+
+---
+
+**🟠 Fix G — `user_roles` junction table (roles, not usernames).** Specs reference roles (`'owner'`, `'admin'`), not individual user names. Who holds which role is managed in the CRM, not in spec code.
+
+```sql
+CREATE TABLE user_roles (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id     UUID NOT NULL REFERENCES auth.users(id),
+  role        TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'reviewer', 'read_only')),
+  granted_by  UUID REFERENCES auth.users(id),
+  granted_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at  TIMESTAMPTZ,
+  UNIQUE NULLS NOT DISTINCT (user_id, role, revoked_at)  -- allow one active row per user+role
+);
+
+CREATE INDEX idx_user_roles_active ON user_roles(user_id, role) WHERE revoked_at IS NULL;
+```
+
+Role semantics (first cutover):
+- **`owner`** — Antonio. Can override any spec value, approve any exception, access all admin functions.
+- **`admin`** — Luca (and future staff). Can override cadences, escalation thresholds, non-pricing exception configs. Cannot change pricing, cannot approve owner-only exceptions.
+- **`reviewer`** — future read-only auditor role.
+- **`read_only`** — service account or external integrations.
+
+Role-checking at override time:
+```typescript
+// lib/specs/permissions.ts
+export async function canOverridePath(
+  userId: string,
+  rulePath: string,
+): Promise<boolean> {
+  const policy = await db.rule_path_policy.findFirst({ where: { path_prefix: rulePath } });
+  if (!policy) return false;  // no policy = not overridable
+  const userRoles = await getActiveRoles(userId);
+  return policy.allowed_roles.some(r => userRoles.includes(r));
+}
+```
+
+The `rule_path_policy` table maps path prefixes to allowed roles:
+```sql
+CREATE TABLE rule_path_policy (
+  path_prefix   TEXT NOT NULL,    -- e.g., 'pricing_rules.*', 'follow_up_rules.*'
+  allowed_roles TEXT[] NOT NULL,  -- e.g., ['owner'], ['owner','admin']
+  PRIMARY KEY (path_prefix)
+);
+
+-- Seed data:
+-- 'pricing_rules.*'   → ['owner']
+-- 'follow_up_rules.*' → ['owner', 'admin']
+-- 'exceptions_config.*' → ['owner', 'admin']
+```
+
+---
+
+**🟡 Fix N — `spec_version_warnings` table.** Admins need visibility when an engagement is pinned to a deprecated or flagged spec version. Without this, they may wonder why behavior differs from current spec.
+
+```sql
+CREATE TABLE spec_version_warnings (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  spec_id     UUID NOT NULL REFERENCES service_specs(id),
+  severity    TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error')),
+  code        TEXT NOT NULL CHECK (code IN (
+                'deprecated',          -- this version has been superseded; still functional
+                'breaking_change_available',  -- new version has structural changes; manual migration needed
+                'known_issue',         -- this version has a documented bug; describe in message
+                'migration_recommended'       -- soft push to upgrade
+              )),
+  message     TEXT NOT NULL,           -- human-readable explanation for CRM banner
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at TIMESTAMPTZ,
+  resolved_by UUID REFERENCES auth.users(id)
+);
+```
+
+CRM behavior:
+- Engagement detail view and Client 360 show a banner if any active warning exists for the engagement's `spec_id`.
+- Banner severity color: `info` = blue, `warning` = amber, `error` = red.
+- Admin can resolve a warning (marks `resolved_at`). Resolving is not the same as migrating — it's an acknowledgment.
+- Warnings are created by the seeder when it detects a new version supersedes an old one.
+
+---
 
 **What can be overridden:**
-- `pricing_rules.*` (all pricing values).
-- `follow_up_rules.*` (reminder cadences, escalation thresholds).
-- `exceptions_config.*` (who can override what, with what alternatives).
-- Constants in conditions (e.g., the minimum members count for MMLLC).
-- Grace periods, thresholds, cadences.
+- `pricing_rules.*` (all pricing values) — owner only.
+- `follow_up_rules.*` (reminder cadences, escalation thresholds) — owner or admin.
+- `exceptions_config.*` (who can override what, with what alternatives) — owner or admin.
+- Constants in conditions (e.g., the minimum members count for MMLLC) — owner only.
+- Grace periods, thresholds, cadences — owner or admin.
 
 **What cannot be overridden (requires code change):**
 - Requirement *structure* (adding a new requirement, changing `depends_on` topology, changing `per_member` or `per_account` scoping).
 - Condition *shape* (e.g., switching from `field.not_null` to `event_type.exists` is a structural change).
 - Requirement types (`ReqData` vs `ReqDocument` vs `ReqDeliverable` vs `ReqGate`).
 
-This split is the honest version of Antonio's goal: "rules live as data." Value-level edits are data (editable via CRM). Structural edits are code (require deploy). Most business rule changes are value-level — pricing, cadence, threshold.
+This split is the honest version of Antonio's goal: "rules live as data." Value-level edits are data (editable via CRM with role-based authorization). Structural edits are code (require deploy). Most business rule changes are value-level — pricing, cadence, threshold.
 
 ### 6.4 Requirement structure — the four kinds
 
@@ -1010,7 +1168,7 @@ This split is the honest version of Antonio's goal: "rules live as data." Value-
 
 Each requirement also carries:
 - **`key`** — unique within the spec.
-- **`depends_on`** — requirement keys that must be satisfied first.
+- **`depends_on`** — requirement keys that must be satisfied first (within this spec).
 - **`blocks`** — requirement keys that this one blocks (inverse dependency, useful for gates).
 - **`per_member`** / **`per_account`** — scope.
 - **`requires_signer`** — special hint for EIN-like requirements that need the designated signer.
@@ -1018,7 +1176,27 @@ Each requirement also carries:
 - **`ai_evaluable`** — boolean. If true, the requirement's condition is evaluated by the agent rather than the solver directly. The solver does not call the AI inline; instead, it reads the most recent `ai.decision` event for this requirement. If no recent decision exists, it triggers an `agent.invoked` workflow and reports `evaluation_pending`.
 - **`overridable`** — spec-level flag whether exceptions_config applies to this requirement.
 
-### 6.5 Seeding and versioning
+**Cross-engagement dependencies — `dependsOnEngagement()` DSL.** Some requirements in one engagement legitimately depend on a condition in another engagement. Example: a Renewal engagement cannot begin billing until the prior Formation engagement is confirmed as `completed`. Without cross-engagement dependency syntax, this logic either lives as ad-hoc code or gets missed.
+
+```typescript
+import { ReqDeliverable, dependsOnEngagement } from '@/lib/specs/dsl';
+
+// In the renewal spec:
+ReqDeliverable({
+  key: 'prior_formation_confirmed',
+  condition: dependsOnEngagement({
+    type: 'formation',                                // look for a completed engagement of this type
+    for_same_account: true,
+    condition: { status: 'completed' },
+  }),
+  blocks: ['billing_start'],                         // no billing until prior formation confirmed
+  ai_hint: 'Verify prior formation engagement is closed before starting renewal billing',
+}),
+```
+
+The solver evaluates `dependsOnEngagement()` by querying engagements for the same account with the specified type and checking the condition. The result is passed through the same satisfied/missing/blocked/exception pipeline as all other requirements. The cross-engagement dependency graph is registered at seeding time and drives the transitive invalidation logic in the solver cache (Section 7.3).
+
+### 6.5 Seeding and versioning — REVISED v1.1 (🟡 Fix K: DB writes locked to migration role; CI hash check)
 
 On every deploy:
 
@@ -1029,6 +1207,32 @@ On every deploy:
    - If yes: no-op.
    - If no: insert a new row with incremented version. Previous versions are marked `active = false`.
 5. A seeding event is emitted: `spec.created` or `spec.updated` with payload `{ service_type, version, content_hash, git_sha }`.
+
+**🟡 Fix K — spec_json drift prevention:**
+
+**DB write lock (migration role only):** the `service_specs` table's `spec_json`, `requirements`, `pricing_rules`, `follow_up_rules`, and `exceptions_config` columns are writable ONLY by the `migration_role` Postgres role. This role is used exclusively by the seeder script during deploy. Regular app code (including the MCP server's `execute_sql` tool) runs as `authenticated` or `service_role` — neither can write to these columns.
+
+```sql
+-- In Supabase: revoke direct write on spec content columns from non-migration roles
+REVOKE UPDATE (spec_json, requirements, pricing_rules, follow_up_rules, exceptions_config)
+  ON service_specs FROM authenticated, service_role;
+GRANT UPDATE (spec_json, requirements, pricing_rules, follow_up_rules, exceptions_config)
+  ON service_specs TO migration_role;
+-- Note: rule_overrides is writable by service_role (for CRM edit path) — only service_specs columns are locked
+```
+
+**CI hash check:** a CI step runs after every deploy and after every migration:
+```bash
+# scripts/verify-spec-hash.ts
+# For each active spec in the DB:
+#   1. Fetch spec_json and its stored content_hash
+#   2. Recompute hash from spec_json
+#   3. Also compute hash from the TypeScript source (compiled to the same JSON form)
+#   4. Assert DB hash == recomputed hash == TypeScript source hash
+# If any mismatch: fail the CI step and alert
+```
+
+This detects: (a) spec_json edited directly in the DB (hash mismatch between stored content_hash and recomputed), (b) TypeScript spec changed without re-seeding (hash mismatch between TypeScript source and DB). Either way, CI fails before the mismatch reaches production.
 
 ### 6.6 Spec evolution and migration
 
@@ -2062,7 +2266,7 @@ Each editable value has: current effective value, current override (if any), pro
 
 **Version history:** see what changed, when, who changed it. Full audit trail via `spec.updated` + `rule_override.created` events.
 
-### 11.4 Proposal inbox
+### 11.4 Proposal inbox — REVISED v1.1 (🟠 Fix E: evidence_event_hash optimistic concurrency)
 
 A dedicated page at `/admin/proposals` for AI-generated proposals.
 
@@ -2071,9 +2275,46 @@ A dedicated page at `/admin/proposals` for AI-generated proposals.
 - Each proposal shows: action type, target account/engagement, rationale, confidence, evidence events (expandable), blast_radius, alternative considered, weakness acknowledged, scar matches.
 - One-click approve or reject with optional reason.
 
+**🟠 Fix E — Stale-render guard (`evidence_event_hash`).** Every proposal is generated from a snapshot of the engagement's event history. If that history changes between proposal generation and admin approval (a new event arrives — payment confirmed, document uploaded, exception granted — that would have changed what the agent proposed), the admin is acting on stale evidence. This is a known failure mode in any human-in-the-loop system: the supervisor approves an action based on state that has already changed.
+
+```typescript
+type AIProposal = {
+  id: string;
+  engagement_id: string;
+  // ... other fields
+  evidence_event_hash: string;  // SHA-256 of sorted IDs of events that formed the evidence bundle
+  generated_at: TIMESTAMPTZ;
+};
+
+// On admin approval:
+async function approveProposal(proposalId: string, adminUserId: string) {
+  const proposal = await db.proposals.findUnique({ where: { id: proposalId } });
+  
+  // Recompute hash from current events:
+  const currentEvents = await db.events.findMany({
+    where: { subject_id: proposal.engagement_id, created_at: { lte: proposal.generated_at } }
+  });
+  const currentHash = computeEvidenceHash(currentEvents.map(e => e.id));
+  
+  if (currentHash !== proposal.evidence_event_hash) {
+    throw new StaleProposalError(
+      'New events arrived since this proposal was generated. Refresh the page to see the updated state before approving.'
+    );
+  }
+  // proceed with approval
+}
+```
+
+The UI renders the staleness check result before showing the Approve button:
+- If hash matches: green badge "Evidence current as of [timestamp]". Approve available.
+- If hash differs: amber banner "Evidence changed — [N new events since proposal was generated]. Review updated state before approving." Approve is blocked until admin clicks "I've reviewed the updated state" — which re-reads the current solver output inline and regenerates the approval context.
+
+This does not block all concurrent approvals — only approvals where evidence actually changed. Clean proposals approve instantly.
+
 **Batch operations:**
 - Select all proposals of the same type (e.g., "send reminder email") with confidence ≥ threshold.
 - Approve selected (batch) — emits `proposal.approved` for each + triggers each action workflow.
+- Batch approval **excludes proposals with stale evidence by default**. Any proposal where the hash check fails is pulled from the batch and shown as "requires individual review." The admin approves the clean ones, then reviews stale ones one at a time.
 
 **History tab:**
 - Past proposals with their disposition (approved, rejected, auto-executed, expired).
@@ -2239,9 +2480,22 @@ The resolution:
 
 Not all rules can be data. Not all rules should be code. Smart AI makes the split explicit. There are three buckets, in descending order of editability and ascending order of expressive power.
 
-### 13.1 Rules as data (90% of rules)
+### 13.1 Rules as data (90% of rules) — REVISED v1.1 (empirical measurement + role-based permissions)
 
-These live in database tables and are editable through the CRM without a deploy. The canonical buckets:
+**Empirical measurement of the 90/10 split (Stage 0 S0.0.5).** The 90/10 claim is asserted based on Antonio's description of his business rules. It has not been measured. The Stage 0 S0.0.5 task is to extract and classify every known rule from v1 (`knowledge_articles`, `sop_runbooks`, CLAUDE.md R005-R101, v1 dev_task bugfix history) and count what tier each falls into:
+- Data rule (editable value in spec or override)
+- Code rule (TypeScript function in `lib/rules/`)
+- AI rule (`ai_evaluable` flag)
+- Unknown / ambiguous
+
+**Kill criterion:** if the actual ratio is worse than 70/30 (fewer than 70% of rules are data-editable), the spec engine's editorial claim breaks down — most edits require code — and the "rules as data" architecture cannot deliver its core promise. This triggers review per D2. The measurement result is documented in the Stage 0 exit report before Stage 1 begins.
+
+**Role-based access for spec editing (🟠 Fix G).** The rules in this section are editable via the CRM Spec Editor. What "editable" means depends on the admin's role:
+- **`owner` (Antonio):** can edit any value in any spec, including pricing.
+- **`admin` (Luca):** can edit cadences, escalation thresholds, exception configurations. Cannot change pricing_rules.* (pricing changes require `owner` role).
+- Authorization check calls `canOverridePath(userId, rulePath)` (Section 6.3) before every save.
+
+These rules live in database tables and are editable through the CRM without a deploy. The canonical buckets:
 
 **Pricing rules** (in `service_specs.pricing_rules` + `rule_overrides`):
 - Base price by entity type (SMLLC, MMLLC, C-Corp Elected).
@@ -2750,27 +3004,38 @@ Beyond structured output, every response is validated in application code:
    - `reasoning` length is enforced.
 3. **Scar cross-check**: if the proposal's scar_matches reference scars with preventions that the current state doesn't satisfy, the proposal is flagged for human review regardless of confidence.
 
-### 15.6 Calibration loop
+### 15.6 Calibration loop — REVISED v1.1 (Bayesian sequential, not weekly batch)
 
-Model confidence is notoriously miscalibrated (reported 0.9 ≠ actual 0.9 accuracy). The calibration loop measures and corrects:
+Model confidence is notoriously miscalibrated (reported 0.9 ≠ actual 0.9 accuracy). The calibration loop measures and corrects. **v1.1 replaces the weekly batch analysis with a Bayesian sequential test** that detects calibration drift within hours of evidence accumulating — regardless of whether a full week's data has arrived.
 
 **Data collection:** for each proposal or AI decision, we record:
 - The confidence the model reported.
 - The admin's ultimate disposition (approved / rejected) or the outcome (was the decision correct in retrospect).
 - Task type, model used, context bundle size, scar matches.
 
-**Weekly analysis (Batch API, Opus):**
-- For each (task_type, model) pair, bucket by reported confidence (0-0.5, 0.5-0.7, 0.7-0.85, 0.85-0.95, 0.95-1.0).
-- Compute actual accuracy per bucket.
-- If reported-vs-actual diverge, adjust the auto-execution threshold for that (task_type, model) pair.
+**Bayesian sequential calibration:**
+
+For each `(task_type, model, confidence_bucket)` tuple, maintain a Beta distribution `Beta(α, β)` where:
+- `α` = successes (admin approved / outcome correct) + 1 (uninformative prior)
+- `β` = failures (admin rejected / outcome incorrect) + 1 (uninformative prior)
+
+On each new observation, update `α` or `β`. After each update:
+1. Compute posterior mean accuracy: `α / (α + β)`.
+2. Compute the 95% credible interval.
+3. **If** posterior mean diverges from target by > 10% **AND** credible interval width < 0.15: fire an alert and adjust the auto-execution threshold incrementally.
+
+This alerts within hours of sufficient evidence accumulating — not after a weekly batch. At low volumes, the credible interval is wide and no adjustment fires; the prior dominates safely. As volume grows, the CI narrows and adjustments become precise.
+
+**Minimum evidence before any threshold adjustment:** 20 observations per bucket. Below 20, the prior dominates and the estimate is conservative by design.
 
 **Example outcome:**
 - Task: "Classify inbound email to engagement", Model: Haiku 4.5.
 - Initial auto-route threshold: 0.9 reported confidence.
-- After 4 weeks of data: reports 0.9+ → actual 0.78.
-- Threshold adjusted to 0.95 reported confidence to achieve target 0.95 actual.
+- After 150 observations (reports 0.9+): 102 approved, 48 rejected.
+- Posterior mean = 0.68. 95% CI width = 0.14 → drift confirmed. Alert fires within hours of the 150th observation.
+- Threshold adjusted to 0.95 reported confidence to achieve target 0.68+ actual.
 
-This calibration data is stored in `calibration_metrics` table and drives `calibrated_threshold_per_task` config that the agent dispatch reads on every call.
+This calibration data is stored in `calibration_metrics` table (with per-bucket Beta parameters) and drives `calibrated_threshold_per_task` config that the agent dispatch reads on every call.
 
 ### 15.7 Cost monitoring
 
@@ -2826,9 +3091,9 @@ The resolution:
 
 The resolution: the cache is a cost optimization, not a correctness feature. Expiry means full-price input tokens; no functional issue. We size the cost budget with cache-miss factored in.
 
-**[R101-FLAG on calibration overfitting.]** With small N (few hundred invocations per task type per week early on), calibration adjustments can overfit to noise.
+**[R101-FLAG on calibration overfitting.]** With small N (few hundred invocations per task type early on), even Bayesian estimates can be gamed by early observations if the prior is too informative.
 
-The resolution: minimum sample size (50 invocations per bucket) before adjusting threshold. Smoothing (Bayesian) rather than point estimates. Initial thresholds are conservative; they loosen as confidence in calibration data grows.
+The resolution (v1.1): the prior `Beta(1,1)` is uninformative — it assumes no knowledge of accuracy. Adjustments require both posterior-mean divergence (> 10%) AND credible interval width (< 0.15). Both conditions together resist overfitting at low N: the CI cannot be narrow enough to trigger an adjustment until real data has accumulated. Initial thresholds are conservative; they loosen only when the CI narrows from actual data, not from assumed accuracy. Minimum 20 observations per bucket before any adjustment — so a bad first 5 observations don't flip the threshold.
 
 ---
 
@@ -3070,7 +3335,7 @@ Three distinct environments exist across v1 and Smart AI. They never share env v
 - Blocks webhook routes if `SANDBOX_MODE=1` is set (safety).
 - Blocks any reference to v1 Supabase URL (regex check on config); fatal.
 
-### 17.4 Inngest (workflow engine)
+### 17.4 Inngest (workflow engine) — REVISED v1.1 (🟡 Fix O: explicit engine.ts wrapper; direct handler pattern)
 
 **Inngest account setup:**
 - Create a new Inngest organization (or use existing if Antonio has one).
@@ -3080,6 +3345,46 @@ Three distinct environments exist across v1 and Smart AI. They never share env v
 - Configure notification channel (email or Slack) for function failures.
 
 **Pricing tier:** start at Pro ($75/mo). Monitor usage; upgrade if needed. Expected usage 50k-200k executions/month at 225-500 clients, well within Pro limits.
+
+**🟡 Fix O — `lib/workflows/engine.ts` abstraction wrapper.** All workflow invocations in Smart AI route through a single abstraction layer, not directly against the Inngest client. This means a future vendor swap (Temporal, homemade, whatever Antonio approves) is a single-file change, not a codebase-wide search-and-replace.
+
+```typescript
+// lib/workflows/engine.ts
+// The ONLY place in the codebase that imports from 'inngest'.
+// All other code calls this module.
+
+import { inngest } from './inngest-client';
+
+export const workflows = {
+  /**
+   * Trigger an event-driven workflow.
+   * Called from API routes and event handlers.
+   */
+  trigger: async (eventName: string, data: unknown): Promise<void> => {
+    await inngest.send({ name: eventName, data });
+  },
+
+  /**
+   * Register a function that Inngest will invoke.
+   * Called in lib/inngest/ — never directly in business logic.
+   */
+  createFunction: inngest.createFunction.bind(inngest),
+
+  /**
+   * Schedule a cron-based workflow.
+   */
+  schedule: (cronExpression: string, id: string, handler: InngestFunction) =>
+    inngest.createFunction({ id, name: id }, { cron: cronExpression }, handler),
+};
+```
+
+Every file in `lib/` that triggers a workflow imports from `lib/workflows/engine.ts`. The Inngest client (`lib/workflows/inngest-client.ts`) is the only file that touches `inngest` directly.
+
+**Direct handler pattern (infrastructure implications).** Section 5.4 (emit() contract) describes the direct handler pattern in detail. The infrastructure consequence: hot-path handlers (the sync DB operations: entity write + outbox insert) run inside Vercel serverless functions within a single transaction. Inngest reads the outbox for side effects (sending emails, triggering sub-workflows, calling external APIs). This means:
+
+- **Vercel handles the hot path** (fast, < 200ms, within the 60s timeout easily).
+- **Inngest handles the cold path** (durable, retryable, no timeout concern).
+- The separation is enforced by convention: any code that calls `workflows.trigger()` is side-effecting (cold path). Any code that calls `emit()` and returns is hot-path. Cold-path code never happens synchronously inside a hot-path handler.
 
 ### 17.5 Anthropic (Claude API)
 
@@ -3111,13 +3416,14 @@ Three distinct environments exist across v1 and Smart AI. They never share env v
 - Husky pre-push hooks: remote-sync check, hardcoded-domain check, ESLint on changed files vs origin/main, unit tests (Vitest), full `next build`.
 
 **Directory structure (bootstrapped):**
-- `lib/specs/` — TypeScript spec authoring
-- `lib/agents/` — agent dispatch, tools, context builder
-- `lib/policies/` — rule functions (named TS code rules)
+- `lib/specs/` — TypeScript spec authoring (DSL, seed, resolver with pin_date)
+- `lib/agents/` — agent dispatch, tools, context builder, schemas.generated.ts
+- `lib/rules/` — named TypeScript rule functions (< 50 lines each, registered)
 - `lib/scars/` — scar extraction scripts and seed helpers
-- `lib/events/` — emit(), event type definitions, Zod schemas
-- `lib/solver/` — solver logic
-- `lib/inngest/` — Inngest functions
+- `lib/events/` — emit(), event type definitions, Zod schemas, outbox
+- `lib/solver/` — solver logic (pure function, no DB writes)
+- `lib/workflows/` — engine.ts abstraction wrapper + inngest-client.ts (ONLY Inngest import point)
+- `lib/inngest/` — Inngest function definitions (registered via workflows.createFunction)
 - `app/` — Next.js routes (portal, CRM, admin, API)
 - `tests/unit/` — unit tests
 - `tests/integration/` — integration tests
@@ -3188,20 +3494,22 @@ The resolution: MCP tools are parameterized by schema introspection at start-up.
 
 Observability is not optional. It is built into Stage 0 before the first `emit()` call, because the system cannot be operated safely without it. Without observability, silent failures become invisible failures become business incidents.
 
-### 18.1 SLOs
+### 18.1 SLOs — REVISED v1.1 (v1 baselines measured in Stage 0 S0.0.5)
+
+**v1 baseline measurement (Stage 0 S0.0.5).** The SLOs below are informed by v1 production performance. Stage 0 S0.0.5 measures v1's actual p95 for each surface over 2 weeks of production traffic. Smart AI SLOs = v1_baseline ± 10%, with vendor-p95 slack added for Vercel/Supabase/Inngest cold-start scenarios. If v1 currently delivers portal page load at p95 = 2.2s, Smart AI's target is ≤ 2.0s (10% improvement) not some aspirational 1.5s. Aspirational targets that don't ground in baseline create false pass gates.
 
 Service-level objectives for first cutover:
 
-| Surface | SLO | Measurement |
-|---|---|---|
-| Portal page load (p95) | < 1.5 seconds | Vercel analytics + custom timing |
-| CRM client-360 load (p95) | < 2.5 seconds | same |
-| Solver `solve()` call (p95) | < 500ms with cache hit, < 2s cache miss | custom timing in emit of `agent.invoked` |
-| `emit()` call (p95) | < 100ms | custom |
-| Outbox drain lag (p95) | < 10 seconds from `emit()` to `published` | drain worker telemetry |
-| Agent invocation (p95) | < 3 seconds | `ai.decision.duration_ms` |
-| Webhook signature verification | < 50ms | webhook endpoint timing |
-| Availability (per endpoint class) | 99.5% first 90 days, 99.8% after stabilization | Sentry + Vercel + synthetic checks |
+| Surface | SLO | Measurement | Baseline source |
+|---|---|---|---|
+| Portal page load (p95) | ≤ v1_baseline - 10% | Vercel analytics + custom timing | Stage 0 S0.0.5 measurement |
+| CRM client-360 load (p95) | ≤ v1_baseline - 10% | same | same |
+| Solver `solve()` call (p95) | < 500ms with cache hit, < 2s cache miss | custom timing in solve() | New metric (v2 only) |
+| `emit()` call (p95) | < 100ms | custom | New metric (v2 only) |
+| Outbox drain lag (p95) | < 10 seconds from `emit()` to `published` | drain worker telemetry | New metric (v2 only) |
+| Agent invocation (p95) | < 3 seconds | `ai.decision.duration_ms` | New metric (v2 only) |
+| Webhook signature verification | < 50ms | webhook endpoint timing | Same as v1 target |
+| Availability (per endpoint class) | 99.5% first 90 days, 99.8% after stabilization | Sentry + Vercel + synthetic checks | v1 actual ≈ 99.7% |
 
 SLO dashboards surface these weekly. Breaches are investigated per-incident with root-cause analysis added to the scar index.
 
@@ -3293,7 +3601,28 @@ Separate from metrics but critical: every action is auditable.
 
 Audit retention: 7 years minimum (matches US financial-records retention).
 
-### 18.6 Observability rationale and devil's-advocate flags
+### 18.6 Observability rationale and devil's-advocate flags — REVISED v1.1 (🟠 Fix F: multi-vendor degraded mode)
+
+**[R101-FLAG on multi-vendor simultaneous degradation (🟠 Fix F).]** Supabase, Inngest, and Anthropic are all critical vendors. If two or more degrade simultaneously — not full outage, just slow (p95 × 3) — the system is in an unpredictable compound failure state. No individual vendor's dashboard shows the problem; only compound monitoring detects it.
+
+The resolution: **designed degraded mode** with a circuit-breaker trigger.
+
+**Degraded mode trigger criteria (vendor health check runs every 30 seconds):**
+- Supabase: DB query p95 > 3× trailing 10-minute average, sustained 2 minutes.
+- Inngest: event dispatch latency p95 > 5× trailing 10-minute average, or function failure rate > 20%, sustained 2 minutes.
+- Anthropic: API p95 > 5× trailing average, or error rate > 10%, sustained 2 minutes.
+
+**Trigger:** any 2 of the 3 vendors simultaneously in degraded state → system enters degraded mode.
+
+**Degraded mode behavior:**
+- **Portal:** serves cached read-only views. Portal chat disabled (requires DB write). Upload disabled. Badge shown: "System is in maintenance mode. Your data is safe. Actions will resume shortly."
+- **Admin CRM:** read-only. New events are queued to a fallback buffer (Redis-backed or Supabase RPC with retry). AI proposals suspended. Badge shown: "Degraded mode active — [vendors]. Admin reads available; writes queued."
+- **Webhooks:** continue accepting (signature verified, acknowledged 200). Events are queued; drain deferred until recovery.
+- **Agent invocations:** non-critical (nightly analyses, pattern detection) suspended. Critical (response to admin action, portal chat reply) attempted with explicit timeout + fallback message.
+
+**Recovery criteria:** all degraded vendors return to ≤ 1.5× trailing average for ≥ 1 minute → exit degraded mode, drain queued events, resume normal operation.
+
+**Recovery alerting:** page on degraded mode entry, page on recovery. Daily digest if degraded mode recurred > 2 times in 24h.
 
 **[R101-FLAG on observability cost.]** Telemetry infrastructure (Sentry, custom metrics, dashboards) has a cost. Some dashboards may not be used after initial build.
 
@@ -3301,7 +3630,7 @@ The resolution: minimum viable observability first (Sentry + the weekly dashboar
 
 **[R101-FLAG on SLO calibration early on.]** The SLOs above are targets for cutover. During Stage 0 and shadow mode, we don't have production traffic; SLO compliance is hypothetical.
 
-The resolution: Stage 0 uses synthetic load tests (scripted requests with a fixed pattern) to validate SLOs. Shadow mode uses real v1 traffic shape. Both approaches give early signal without risk. Post-cutover, real traffic sets real SLOs and we adjust targets if the first-draft numbers were wrong.
+The resolution: Stage 0 uses synthetic load tests (scripted requests with a fixed pattern) to validate SLOs. Shadow mode uses real v1 traffic shape (v1 baseline measurement in Stage 0 S0.0.5). Both approaches give early signal without risk. Post-cutover, real traffic sets real SLOs and we adjust targets if the first-draft numbers were wrong.
 
 **[R101-FLAG on alert fatigue.]** Too many alerts and nobody reads them. Not enough alerts and incidents are invisible.
 
@@ -3414,7 +3743,7 @@ The full build is divided into stages, each with a clear entry condition, exit c
 
 **Deliverables:**
 - Blast-radius-gated auto-execution for internal_only proposals.
-- Calibration loop in production (weekly analysis, threshold adjustments).
+- Calibration loop in production (Bayesian sequential, threshold adjustments within hours of drift detection).
 - Proposal approval thresholds tuned per task type per model.
 - Scar-match-as-veto: any proposal matching a scar with unsatisfied prevention requires human review.
 - Communication drafting Phase 2: drafts scored for tone/accuracy, admin can edit inline before send.
@@ -3502,7 +3831,7 @@ Shadow mode runs throughout Stages 0-7. Key pieces:
 
 Shadow mode validates v2 without any production effect. If v2 says "requirement missing" and v1 says "satisfied," we investigate (spec bug? import bug? data-quality issue?). We fix. We re-import. We re-diff. We iterate until confident.
 
-### 20.2 Pilot clients (Stage 6-7)
+### 20.2 Pilot clients (Stage 6-7) — REVISED v1.1 (live pilot cohort routing infrastructure)
 
 Before opening v2 to "all new clients," a pilot runs with 2-5 real new clients hand-picked by Antonio:
 
@@ -3511,14 +3840,37 @@ Before opening v2 to "all new clients," a pilot runs with 2-5 real new clients h
 - Any v2 issue surfaced from a pilot client → dev_task + fix + scar.
 - Pilot runs 2 weeks minimum. If zero P0/P1 issues, broader cutover proceeds. If issues, delay.
 
-### 20.3 Cutover day protocol (2026-10-21)
+**Per-client routing infrastructure.** During the pilot period, specific new clients are routed to v2 while all other new clients still route to v1. This requires routing to be deterministic and explicit — not "if date > X use v2" (which would route all clients at once) but "if contact.id IN pilot_list use v2."
+
+```sql
+CREATE TABLE client_routing (
+  contact_id    UUID PRIMARY KEY REFERENCES contacts(id),  -- or email hash pre-contact-creation
+  system        TEXT NOT NULL CHECK (system IN ('v1', 'v2')),
+  reason        TEXT NOT NULL,      -- 'pilot_cohort', 'new_client_post_cutover', 'migrated_feature:itin'
+  assigned_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  assigned_by   UUID REFERENCES auth.users(id)
+);
+```
+
+The offer flow's first action on a new lead: look up `client_routing`. If a row exists → route accordingly. If no row → default to v1 pre-cutover, v2 post-cutover. Antonio (owner role) can insert pilot routing rows via the CRM without a deploy.
+
+This infrastructure is the same mechanism used post-cutover for feature-by-feature migration of existing v1 clients: when an existing client's ITIN service migrates to v2, a row is inserted routing their ITIN engagement to v2 while their formation/renewal stays on v1.
+
+### 20.3 Cutover day protocol (2026-10-21) — REVISED v1.1 (🔴 Fix C: knowledge_articles + sop_runbooks migration)
 
 On cutover day, the sequence:
+
+**T-72h (knowledge migration prep):**
+- Export `knowledge_articles` and `sop_runbooks` from v1 Supabase to v2 Supabase (full copy, not shadow-mode read-through).
+- Start one-way sync: a cron job runs every 15 minutes, comparing v1 table checksums vs v2. Any rows updated or inserted in v1 after the export are replicated to v2. **Direction is v1 → v2 only.** If v2 has edits to the same row, v2 wins (v2 is the live system). Log any conflict.
+- Validate: run `kb_search` and `sop_search` against v2 — confirm same results as v1 for top 10 queries.
+- D9 update: the "shared knowledge_articles and sop_runbooks (read from v1)" contract transitions to "v2 owns its own copy; sync during hybrid period."
 
 **T-24h:**
 - Final shadow diff review across all 30 panel clients. Zero material diffs required.
 - Verify all env vars in Vercel `td-operations-v2`.
 - Verify domain `v2.tonydurante.us` resolves correctly.
+- Verify `kb_search` + `sop_search` returning v2-owned data (not proxying v1).
 - Inngest dashboard green.
 - Anthropic/OpenAI quotas confirmed.
 - Announce to team (Antonio + Luca) that cutover is T-24h.
@@ -3532,6 +3884,8 @@ On cutover day, the sequence:
 **T+1h:** first expected new-client traffic on v2. Validate the full happy path (offer signed → payment → engagement → portal login → wizard start) via a test account.
 
 **T+24h:** if green, announce to team that cutover is stable. Daily reviews for 30 days. Shadow mode continues.
+
+**Post-cutover knowledge sync:** the one-way sync (v1 → v2) continues until all knowledge edits move to v2. Target: 30 days post-cutover, v2 is the editing surface for `knowledge_articles` and `sop_runbooks`; sync is disabled; v1's copies are frozen. This removes the last operational dependency on v1 Supabase, making v1 archivable.
 
 ### 20.4 Rollback plan
 
@@ -3858,6 +4212,7 @@ The nine load-bearing architectural decisions signed off by Antonio on 2026-04-2
 **Rationale:** Vercel-native, serverless-first, observability baked in, days-to-ship (not weeks). No new ops surface. Designed for agent-heavy, event-driven workloads; avoids Temporal's LLM-payload saturation that forces external payload codec work.
 **Cost:** starts $75/mo (Pro tier); scales to $300-600/mo at 500-1,000 clients.
 **Revisit if:** we outgrow Vercel, or if workflows span months with hundreds of steps each.
+**Kill criteria:** Inngest function execution P95 > 10s for any workflow sustained > 1 week; OR Inngest cost > $2,000/mo; OR more than 2 Inngest outages > 1h in any 90-day window. Kill trigger → evaluate Temporal (managed via Temporal Cloud) as replacement; all swappable via `lib/workflows/engine.ts`.
 
 ### D2 — Rules engine: TypeScript rules + CRM override layer
 **Decision:** Rules authored in TypeScript (type-safe, tested, versioned in Git). Runtime-editable values live in `rule_overrides` table with CRM UI.
@@ -3865,34 +4220,40 @@ The nine load-bearing architectural decisions signed off by Antonio on 2026-04-2
 **What requires code:** new rule shapes, new rule categories, structural changes.
 **Rejected:** OPA/Rego (Antonio won't author it), Cedar (same), pure-JSONB-in-DB (no type safety, fragile).
 **Future extension (Stage 4+):** visual workflow builder à la Harvey AI's pattern (25,000 client-built workflows).
+**Kill criteria:** Stage 0 S0.0.5 empirical rule classification shows < 70% of rules are data-tier (editable without deploy). If ratio is < 70%, the "rules as data" premise fails; evaluate pure-JSONB schema with strict validation or a lightweight rule DSL that compiles to JSON instead.
 
 ### D3 — Agent architecture: single Ops Agent + strong context (Stage 1); specialists later
 **Decision:** Stage 1 ships ONE "Ops Agent" with scoped tools + per-client context bundles. Revised from earlier 6-agent proposal based on 2026 production research.
 **Rationale:** single-agent-with-good-context outperforms multi-agent for sequential workloads. Multi-agent pays off only when tasks run concurrently.
 **Specialists emerge later** (Billing, Tax, Compliance, Communications, Portal-Support) only when distinct concurrent workloads or model-tier needs justify.
 **Context bundle per invocation:** recent events, current solver state, retrieved SOPs via pgvector, retrieved v1 Scar Index entries relevant to the proposed action.
+**Kill criteria:** admin approval rate on agent proposals < 70% averaged over any 30-day window after Stage 2 launch (implying the agent is not generating useful proposals). Kill trigger → audit proposal quality, adjust context bundle or model tier; if approval rate stays < 70% after adjustment, introduce specialist agents by domain.
 
 ### D4 — Hosting floor: Vercel + Supabase + Inngest. No new providers.
 **Decision:** Stay on Vercel for Next.js. Supabase for data + auth + realtime. Inngest for durable workflows.
 **Rationale:** Cloudflare's Vinext (Next.js on Workers) is experimental (Feb 2026 release, not battle-tested) — not production-ready. AI API calls go out regardless of host, so hosting doesn't change AI economics.
 **Added later (Stage 2+):** pgvector inside Supabase for retrieval. Upgrade to managed vector DB only if pgvector becomes bottleneck.
+**Kill criteria:** Vercel serverless function cold-start P99 > 3s on any production endpoint for > 2 weeks; OR Supabase data loss incident; OR any vendor materially changes pricing such that combined Vercel + Supabase + Inngest > $2,000/mo at 500 clients. Kill trigger → evaluate Cloudflare Workers (Next.js on Workers, if mature) as hosting replacement; Supabase is harder to swap (data + auth + realtime in one); evaluate only on data loss or severe SLA breach.
 
 ### D5 — AI cost ceiling: $4,000/month hard cap, alert at 80% ($3,200)
 **Baseline model mix:** Claude Haiku 4.5 (70%), Sonnet 4.6 (25%), Opus 4.7 (5%). Prompt caching + Batch API applied wherever input is cacheable.
 **Estimated spend:** 225 clients → $900-1,400/mo. 500 → $1,800-2,500/mo. 1,000 → $3,500-5,000/mo (will require raising cap near capacity).
 **Anchor:** Antonio pays $4k/mo for an employee delivering ~25% of required output. AI spend under this ceiling is economically justified.
 **Priority:** quality over cost. Do not trade 10% quality for $500 savings.
+**Kill criteria:** AI cost > $4,000/mo for 2 consecutive months AND quality metrics (admin approval rate, escalation rate) are not improving. This is not "spend is too high" — it's "spend is too high AND value is not being delivered." If both are true: audit task-type costs, kill highest-cost lowest-value task types first.
 
 ### D6 — First-cutover feature scope: new-client lifecycle only
 **In scope:** SMLLC + MMLLC Formation, Client Onboarding, Tax Return (intake + routing only), payment capture (Stripe/Whop/wire) with version-pinned pricing, Portal v2, CRM v2, Ops Agent, Inngest workflows for formation/onboarding/tax-intake.
 **Out of scope:** ITIN, Closure, CMRA, Banking wizard, OA/Lease generation, annual renewal, QB sync, India tax routing, bank statements, referrals, ~40 secondary MCP tools.
 **Existing 253 clients:** stay on v1 through cutover. Feature-by-feature migration in batches after.
+**Kill criteria:** scope creep — if any out-of-scope item gets designed, specced, or built before the in-scope items are complete, this is a scope breach. Kill trigger → stop, revert, document the scar, reconfirm scope with Antonio.
 
 ### D7 — Forcing function: cutover 2026-10-21 (6 months from decision)
 **First new client lands on Smart AI TD Operations on 2026-10-21.**
 If 7-8 months proves necessary, extend explicitly with Antonio approval.
 If 12+ months, it's a red flag. Antonio should challenge me.
 Date is checked at every session start. Drifting past requires explicit decision, not silent slide.
+**Kill criteria:** if Stage 0 and Stage 1 are not complete by 2026-07-01 (3 months into the build), the 2026-10-21 cutover is at risk. At that point: Antonio reviews whether to extend the date, reduce scope further, or accept a partial cutover (formation only, not onboarding + tax). Silent drift past 2026-10-21 without an explicit decision is the kill event — it means the forcing function failed.
 
 ### D8 — Sandbox + Vercel + repo isolation (strict)
 **Smart AI Supabase ref:** `tapbgvbglqacamhayfel` (verified alive 2026-04-21).
@@ -3902,11 +4263,16 @@ Date is checked at every session start. Drifting past requires explicit decision
 **Smart AI CLAUDE.md:** new file in new repo. Inherits only R070 + R091 + R093 + R101 from v1.
 **v1 sandbox `xjcxlmlpeywtwkhstjlw`** continues for v1 testing.
 **Hard rule:** no v1 env var, webhook URL, Supabase ref, or API endpoint appears in Smart AI config and vice versa. `EXPECTED_SUPABASE_REF` assertion enforces at boot.
+**Kill criteria:** any code commit to the Smart AI repo that references v1 Supabase ref (`ydzipybqeebtpcvsbtvs`) or v1 domain. This is a zero-tolerance rule. Discovery triggers: revert commit, scar created, R093 check protocol re-run for that section of code.
 
-### D9 — What stays shared with v1, what stays separate
-**Shared:** `knowledge_articles` (Master Rules KB, R060-canonical), `sop_runbooks` (procedures). Business rules don't split when code does. Smart AI reads these from v1's Supabase via a read-only retrieval layer.
-**Separate:** code repo, CLAUDE.md, local directory, dev_tasks, session_checkpoints, action_log, MCP server instance, Vercel project, domains.
+### D9 — What stays shared with v1, what stays separate — REVISED v1.1 (🔴 Fix C: knowledge migration path)
+**Shared during build (Stages 0-7):** Smart AI reads `knowledge_articles` and `sop_runbooks` from v1's Supabase via a read-only retrieval layer. Business rules don't split while the code is still being built.
+**Separate now:** code repo, CLAUDE.md, local directory, dev_tasks, session_checkpoints, action_log, MCP server instance, Vercel project, domains.
 **Hybrid (project-management artifacts):** architecture sysdocs, stage worklists, build dev_task live in v1's Supabase for now (one read surface for Antonio). May migrate to Smart AI's Supabase post-cutover.
+
+**At cutover (🔴 Fix C — closes the zombie problem):** `knowledge_articles` and `sop_runbooks` are **copied** to v2 Supabase at T-72h. A one-way sync (v1 → v2) runs during the hybrid period. 30 days post-cutover, v2 becomes the editing surface; sync stops; v1's copies are frozen. This removes the last operational dependency on v1 Supabase, making v1 fully archivable.
+
+**Kill criteria for D9 (v1 decommission):** v1 is archivable when: (a) all clients routed to v2 (client_routing table shows zero 'v1' rows), (b) `knowledge_articles` sync stopped (v2 is editing surface), (c) all v1 webhooks deregistered and redirected to v2, (d) v1 infrastructure cost confirmed $0 for 30 consecutive days. Until all four are true, v1 is maintained.
 
 ---
 
