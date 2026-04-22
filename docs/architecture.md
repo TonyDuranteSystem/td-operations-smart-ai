@@ -1,10 +1,10 @@
 # Smart AI TD Operations — Architecture Plan
 
-**Version:** 1.1 — Post-Round 2 adversarial review
-**Date:** 2026-04-22 (v1.1 revision); 2026-04-21 (v1.0)
-**Status:** Pre-build. Signed-off decisions (D1-D9) locked with named kill criteria. Plan revised against Rounds 1 and 2; open for Round 3 structured challenge before Stage 0 begins.
+**Version:** 1.2 — Post-Round 3 adversarial review (final)
+**Date:** 2026-04-22 (v1.2 revision); v1.1 same date; 2026-04-21 (v1.0)
+**Status:** Pre-build. Three rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
 
-## v1.1 Changelog — What Changed Since v1.0
+## v1.2 Changelog — What Changed Since v1.0
 
 ### Round 1 (Round-1 reviewer-raised): 12 fixes accepted, revised, and re-evaluated
 
@@ -30,7 +30,7 @@
 | 🔴 A. Rule overrides retroactively change pinned engagements | Silent pricing bug breaks contracted prices | **Spec resolution takes `pin_date`; engagement passes its `created_at`; override UI defaults to new-engagements-only** |
 | 🔴 B. Agents see PII in context bundles (names, emails) | GDPR input-side gap survives deletion | **Extend tokenization to `contact_name_token` + `contact_email_token` in `sensitive_data`; agents operate on tokens; UI renders via template slots** |
 | 🔴 C. D9 makes v1 an undecommissionable zombie | v1 can never shut down | **Migrate `knowledge_articles` + `sop_runbooks` to v2 at cutover; one-way sync during hybrid period; v1 archivable post-full-migration** |
-| 🟠 D. Outbox drain SPOF | Silent degradation on drain stall | **Primary Inngest + fallback Vercel cron (60s) + Supabase Edge Function monitoring on different infrastructure** |
+| 🟠 D. Outbox drain SPOF | Silent degradation on drain stall | **Primary Inngest + fallback Vercel cron (60s) + external uptime monitor (Cloudflare Worker / Better Stack) on genuinely separate infrastructure** |
 | 🟠 E. Stale-render → admin action race | Approval on stale evidence | **Optimistic concurrency: `evidence_event_hash` on proposals, rejected on mismatch** |
 | 🟠 F. Multi-vendor simultaneous degradation | Unpredictable compound failure | **Designed degraded mode: ≥2 vendors slow → read-only mode with visible banner; circuit-breaker trigger and recovery criteria** |
 | 🟠 G. User-name-based permissions | Admin changes = code deploys | **`user_roles` junction table; specs reference roles not usernames** |
@@ -43,20 +43,34 @@
 | 🟡 N. No surface for deprecated spec versions | Admins blind to flagged versions | **`spec_version_warnings` table; CRM banner on flagged engagements** |
 | 🟡 O. Inngest abstraction layer implied | Vendor swap requires rewrites | **Explicit `lib/workflows/engine.ts` wrapper; all workflows route through it** |
 
-### What v1.1 does NOT change
+### Round 3 (third reviewer, architecture-only): 6 load-bearing flaws + 3 significant
 
-- Five-layer architecture (conceded as correct decomposition).
-- Event sourcing as substrate (conceded as right tradeoff).
+| Flaw | Consequence | Fix |
+|---|---|---|
+| 🔴 1. Fix E tautological — evidence_event_hash predicate `lte` returns same set always | Guard fires never; stale-evidence approvals happen at full rate | **Invert: query events with `created_at > proposal.generated_at`; include cross-engagement events matching solver invalidation graph** |
+| 🔴 2. account_members UNIQUE constraint broken under Postgres NULL semantics | Two simultaneous active memberships allowed; solver double-counts per_member requirements | **Replace with partial unique index: `CREATE UNIQUE INDEX ON account_members(account_id, contact_id) WHERE left_at IS NULL`** |
+| 🔴 3. emit() two atomicity contracts; unsafe default | Callers use RPC emit() outside a transaction by default; split-brain on any emit() failure | **Single export `withEmit(tx, callback)`; internal RPC becomes private; no public bare emit()** |
+| 🔴 4. GDPR deletion contradicts FK schema — deleting sensitive_data rows throws FK violation | GDPR compliance blocked by database constraint on first attempt | **Soft-delete: set `encrypted_value = NULL` + `deleted_at`; resolver returns null; FK preserved** |
+| 🔴 5. Outbox drain publishes to global `'events'` channel; portal subscribes to engagement-scoped channels | Portal receives nothing from drain; Realtime latency SLO permanently unmet | **Drain computes channel from `engagement_id`/`account_id`; publishes there; admin broadcast is separate** |
+| 🔴 6. Agent dispatch idempotency key uses UTC day bucket with no context fingerprint | Context changes mid-day (new member, exception, payment) produce same key → Inngest dedupes → 24h staleness | **Key includes `hash(active_member_ids, max_event_id, active_exception_ids, spec_version)`; dispatch-throttle table for cost control** |
+| 🟠 7. Exception expiry cron uses two transactions (UPDATE then emit()) | Split-brain: state updates without event or event without state depending on failure order | **All crons use `withEmit(tx, callback)`; §16.4 crons audited against this rule** |
+| 🟠 8. "Different infrastructure" monitor is a Supabase Edge Function — same infra as what it monitors | Regional Supabase incident blinds the monitor simultaneously | **Move monitor to Cloudflare Worker cron or Better Stack — genuinely external to Supabase, Vercel, and Inngest** |
+| 🟠 9. Calibration conflates admin approval with correctness | Batch-approve UX creates rubber-stamp feedback loop; thresholds drift down as quality degrades | **Separate `admin_approved` (immediate) from `outcome_correct` (materialized later); calibration runs on `outcome_correct` only** |
+
+### What v1.2 does NOT change
+
+- Five-layer architecture (conceded as correct decomposition, three rounds).
+- Event sourcing as substrate (conceded as right tradeoff, three rounds).
 - Engagements as primary commercial object (correct with `account_case` alongside it).
-- TypeScript specs + runtime overrides (conditional on Fix 7 measurement; kill-able if ratio wrong).
+- TypeScript specs + runtime overrides (conditional on S0.0.5 measurement; kill-able if ratio wrong).
 - Single Ops Agent at Stage 1 (conceded).
-- Inngest as workflow engine (conceded; now with explicit abstraction).
-- Multi-model tiering (conceded; calibration now real-time).
+- Inngest as workflow engine (conceded; abstracted behind `lib/workflows/engine.ts`).
+- Multi-model tiering (conceded; calibration now Bayesian sequential).
 - Scope, timeline, build stages (owner's decision, not architectural).
 
-### What v1.1 adds by way of scar protection
+### What v1.2 adds by way of scar protection
 
-Every flaw identified in Round 2 becomes a scar in `v1_scars` (now treated as design-time reference per Round 1 Fix 9, not runtime retrieval at Stage 0). The category, what_broke_in_design_review, root_cause, and smart_ai_prevention are captured for each. Future designs (Stage 1+ spec evolution, new service types) must check against these scars.
+Every flaw identified in Rounds 2 and 3 becomes a scar in `v1_scars`. The category, what_broke_in_design_review, root_cause, and smart_ai_prevention are captured for each. Future designs (Stage 1+ spec evolution, new service types) must check against these scars before shipping.
 
 ---
 
@@ -396,11 +410,19 @@ CREATE TABLE account_members (
   notes               TEXT,
   created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  UNIQUE (account_id, contact_id, left_at)             -- partial uniqueness; allows rejoining after leaving
+  -- NO table-level UNIQUE on left_at — NULL semantics in Postgres break it (NULL != NULL, allowing duplicate active rows)
+  -- Enforced by partial unique index below instead
 );
 
-CREATE INDEX idx_account_members_active ON account_members(account_id) WHERE left_at IS NULL;
+-- REVISED v1.2 (🔴 Fix 2): partial unique index enforces "one active membership per contact per account".
+-- UNIQUE on (account_id, contact_id, left_at) at table level is broken: two rows with left_at=NULL are
+-- treated as distinct by Postgres NULL semantics → both are inserted → solver double-counts per_member reqs.
+CREATE UNIQUE INDEX uq_account_members_active
+  ON account_members(account_id, contact_id) WHERE left_at IS NULL;
+
+-- Historical memberships (left_at IS NOT NULL) may duplicate contact across time — intentional.
 CREATE INDEX idx_account_members_contact ON account_members(contact_id);
+CREATE INDEX idx_account_members_account ON account_members(account_id) WHERE left_at IS NULL;
 ```
 
 **Key improvements over v1's `account_contacts`:**
@@ -409,7 +431,7 @@ CREATE INDEX idx_account_members_contact ON account_members(contact_id);
 2. **`left_at` supports member removal without data loss.** A member who leaves is still in the history; ownership_pct and role at time of departure are preserved. Historical queries can reconstruct the membership at any point in time.
 3. **`added_by` tracks provenance.** You always know how a member got into the system — wizard-created, admin-added, agent-proposed-and-approved, bulk-imported, or migrated from v1.
 4. **`role` is flexible.** Owner, member, manager, agent, signer, officer — any role the business defines. New roles are added as a CHECK constraint amendment (one migration). Not as a code refactor.
-5. **Partial unique constraint.** `(account_id, contact_id, left_at)` allows a contact to rejoin an account they previously left — the `left_at=NULL` slot is occupied only by the currently-active membership; historical rows have `left_at` set and don't conflict.
+5. **Partial unique index on active memberships (REVISED v1.2, 🔴 Fix 2).** A table-level `UNIQUE (account_id, contact_id, left_at)` is broken under Postgres NULL semantics: two rows with `left_at = NULL` are considered distinct (NULL ≠ NULL in Postgres unique constraints), so both insert and duplicate active memberships exist. v1.2 uses a partial unique index `WHERE left_at IS NULL` instead — this physically prevents two active rows for the same (account, contact) pair while allowing multiple historical rows (with `left_at` set) for the same pair, supporting the rejoin pattern. The index name is `uq_account_members_active`. Any other table in the schema with a `UNIQUE (..., nullable_col)` pattern must be audited against the same defect.
 
 **`engagements` (the commercial relationship).** New entity that represents the relationship between Tony Durante LLC and a client around a specific contract. This is where offers, contracts, services, and payments are anchored.
 
@@ -610,11 +632,11 @@ CREATE INDEX idx_outbox_publishing ON outbox(locked_at) WHERE status = 'publishi
 
 `emit()` returns the event_id. The caller does not wait for the event to be *published* — only for it to be *recorded*.
 
-**Outbox drain is NOT a single point of failure in v1.1.** Three independent layers of resilience:
+**Outbox drain is NOT a single point of failure in v1.2.** Three independent layers of resilience:
 
 1. **Primary drain**: Inngest scheduled function, every 10 seconds (plus Realtime-triggered on insert for low-latency).
 2. **Fallback drain**: Vercel cron function, every 60 seconds. Claims any outbox rows where `locked_at` is older than 60 seconds (primary crashed mid-batch).
-3. **Monitoring path on different infrastructure**: a Supabase Edge Function (not Inngest, not Vercel cron) runs an outbox-depth query every 30 seconds. If `SELECT count(*) FROM outbox WHERE status='pending' AND created_at < now() - interval '2 minutes' > 100`, pages via SMS (Twilio). The monitoring path must be on different infrastructure from both drains so the failure of one doesn't blind the others.
+3. **Monitoring path on genuinely separate infrastructure**: a **Cloudflare Worker cron** (or Better Stack uptime check) — NOT a Supabase Edge Function, because Supabase Edge Functions run on the same regional infrastructure as the Supabase database being monitored. A regional Supabase incident would simultaneously disable the database AND blind a Supabase Edge Function monitor. The Cloudflare Worker runs outside Supabase, Vercel, and Inngest. It polls a public health endpoint (`GET /api/health/outbox-depth`, protected by a secret header) every 30 seconds. If the endpoint reports `pending_stale_count > 100` (events pending for > 2 minutes), the Worker fires an SMS alert via Twilio.
 
 A primary drain worker runs on Inngest (scheduled every 10 seconds, plus triggered on `outbox` insert via a Supabase Realtime subscription for low-latency):
 
@@ -632,8 +654,28 @@ export const outboxDrain = inngest.createFunction(
         try {
           // Publish to Inngest event stream for downstream workflows
           await inngest.send({ id: row.event_id, name: row.event_type, data: row.payload });
-          // Publish to Supabase Realtime channel for UI live updates
-          await supabase.channel('events').send({ type: 'broadcast', event: row.event_type, payload: row });
+
+          // 🔴 Fix 5 — Publish to engagement-scoped Realtime channels, not a global 'events' channel.
+          // Portal pages subscribe per-engagement (e.g. channel `engagement:{id}`).
+          // A global channel would require every portal session to receive every event — noise +
+          // security leak. The drain computes the correct channel from subject_id / account_id.
+          if (row.subject_type === 'engagement') {
+            // Engagement-scoped channel: portal engagement detail page, CRM engagement view
+            await supabase
+              .channel(`engagement:${row.subject_id}`)
+              .send({ type: 'broadcast', event: row.event_type, payload: row });
+          }
+          if (row.account_id) {
+            // Account-scoped channel: CRM account 360 view, portal account dashboard
+            await supabase
+              .channel(`account:${row.account_id}`)
+              .send({ type: 'broadcast', event: row.event_type, payload: row });
+          }
+          // Admin broadcast channel: CRM global activity feed (admin-only, no PII in payload)
+          await supabase
+            .channel('admin:broadcast')
+            .send({ type: 'broadcast', event: row.event_type, payload: { event_id: row.event_id, event_type: row.event_type, account_id: row.account_id } });
+
           // Mark as published
           await supabase.from('outbox').update({ status: 'published', published_at: new Date() }).eq('id', row.id);
         } catch (err) {
@@ -736,13 +778,65 @@ Events are organized by domain. The catalog below is the first-cutover set (Stag
 
 This catalog grows as the system grows. Adding a new event type is adding a TypeScript type definition to `lib/events/types.ts`, a Zod schema validator, and a row to a registry — not a code refactor across many files.
 
-### 5.4 emit() contract — REVISED v1.1
+### 5.4 emit() contract — REVISED v1.2 (🔴 Fix 3: single `withEmit()` export; no public bare emit())
 
-`emit()` is the single entry point for writing to the event log. No other code writes directly to `events` or `outbox`. This is enforced by:
+`withEmit()` is the single exported entry point for writing to the event log. No other code writes directly to `events` or `outbox`. No code calls an internal emit directly. The internal `_emitRpc()` is not a public API.
 
-1. **ESLint rule** (`no-restricted-syntax` targeting `.from('events')` and `.from('outbox')` outside `lib/events/emit.ts`).
-2. **Code review discipline.**
-3. **Runtime check** in CI: grep the codebase for prohibited patterns; build fails if found.
+**Why single export matters:** v1.1 exported both `emit()` (RPC-based, its own transaction) and `emitInTransaction(tx, ...)` (caller's transaction). This made the unsafe variant the ergonomic default: `await dbUpdate(X); await emit(Y)` compiles and passes review, but the two calls run in separate transactions. If `emit()` fails, the state write already committed — permanent split-brain. Under production load, some fraction of emit() calls will fail intermittently; every one produces silent state-vs-event divergence where the solver caches stale state forever. v1.2 closes this footgun by making the unsafe form physically unrepresentable.
+
+```typescript
+// lib/events/emit.ts — ONLY public export is withEmit()
+
+/**
+ * The ONLY way to emit an event. Caller passes entity writes as a callback
+ * alongside the emit call, so both happen in a single Postgres transaction.
+ *
+ * Usage:
+ *   await withEmit(async (emit) => {
+ *     await tx.from('engagements').update({ status: 'active' }).eq('id', id);
+ *     await emit({ event_type: 'engagement.started', ... });
+ *   });
+ *
+ * The tx handle is opened inside withEmit — no caller receives a raw tx.
+ * Both the entity write and the outbox insert commit together or roll back together.
+ */
+export async function withEmit(
+  callback: (emit: EmitFn) => Promise<void>,
+): Promise<{ event_id: string }[]> {
+  const emittedIds: { event_id: string }[] = [];
+
+  await supabaseAdmin.rpc('run_in_transaction', async () => {
+    const emit: EmitFn = async (input) => {
+      if (requiresIdempotencyKey(input.actor_type) && !input.idempotency_key) {
+        throw new EmitError(`idempotency_key required for actor_type=${input.actor_type}`);
+      }
+      const schema = eventSchemas[input.event_type];
+      const validated = schema.parse(input.payload);  // Zod validation before write
+      const result = await _emitRpc(validated);        // internal, not exported
+      emittedIds.push(result);
+    };
+    await callback(emit);
+  });
+
+  return emittedIds;
+}
+
+// Internal implementation — NOT exported. This cannot be called from outside emit.ts.
+async function _emitRpc(validated: ValidatedEventInput): Promise<{ event_id: string }> {
+  return await supabaseAdmin.rpc('emit_event', { /* ... */ });
+}
+
+// ESLint rule in .eslintrc.json:
+// "no-restricted-imports": [{ "name": "@/lib/events/emit", "importNames": ["_emitRpc"] }]
+// No one can import the internal function even if they try.
+```
+
+**Enforced by three layers:**
+1. **Single public API:** `withEmit()` is the only export from `lib/events/emit.ts`. `_emitRpc` is a module-private function.
+2. **ESLint rule:** `no-restricted-syntax` targeting `.from('events')` and `.from('outbox')` outside `lib/events/emit.ts`.
+3. **CI grep:** regex scan for `_emitRpc`, `.from('events')`, `.from('outbox')` outside their permitted files. Build fails on match.
+
+**The transaction ceiling rule applies inside `withEmit` callbacks:**
 
 #### Transaction size ceiling (v1.1 HARD limit)
 
@@ -755,70 +849,53 @@ The calling transaction that wraps `emit()` MUST stay under:
 **Example: payment confirmation (state changes span accounts + engagements + service_deliveries + members + notifications):**
 
 ```typescript
-// lib/inngest/functions/payment-confirmed.ts
+// lib/inngest/functions/payment-confirmed.ts — v1.2 using withEmit()
 export const paymentConfirmedFlow = inngest.createFunction(
   { id: 'payment-confirmed-flow' },
   { event: 'payment.confirmed' },  // triggered by outbox drain
   async ({ event, step }) => {
-    // Step 1: update engagement status (1 write + 1 emit, atomic)
+    // Step 1: update engagement status (1 write + 1 emit, atomic inside withEmit)
     await step.run('activate-engagement', async () => {
-      await dbTransaction(async (tx) => {
-        await tx.from('engagements').update({ status: 'active', started_at: now() }).eq('id', event.data.engagement_id);
-        await emitInTransaction(tx, { event_type: 'engagement.started', ... });
+      await withEmit(async (emit) => {
+        await supabaseAdmin.from('engagements')
+          .update({ status: 'active', started_at: new Date() })
+          .eq('id', event.data.engagement_id);
+        await emit({ event_type: 'engagement.started', actor_type: 'inngest',
+          idempotency_key: webhookIdempotencyKey('inngest', `activate:${event.data.engagement_id}`), ... });
       });
     });
 
     // Step 2: generate invoice (1 write + 1 emit, atomic)
-    await step.run('generate-invoice', async () => { ... });
+    await step.run('generate-invoice', async () => {
+      await withEmit(async (emit) => {
+        // ... invoice insert + payment.invoice_generated emit
+      });
+    });
 
     // Step 3: activate services (N service_deliveries; each is its own step iteration)
-    await step.run('activate-services', async () => { ... });
+    await step.run('activate-services', async () => {
+      await withEmit(async (emit) => {
+        // ... service_delivery updates + service.activated emit
+      });
+    });
 
     // Step 4: enqueue welcome communication (1 write + 1 emit, atomic)
-    await step.run('queue-welcome', async () => { ... });
+    await step.run('queue-welcome', async () => {
+      await withEmit(async (emit) => {
+        // ... communication_queue insert + communication.queued emit
+      });
+    });
   }
 );
 ```
 
 Each step is its own atomic unit. Inngest checkpoints between steps. No single transaction holds locks long enough to exhaust the connection pool.
 
-#### Idempotency-key contract (v1.1 REQUIRED for non-human actors)
+#### Idempotency-key contract (REQUIRED for non-human actors)
 
-```typescript
-// lib/events/emit.ts
-import { eventSchemas } from './schemas';
-import { z } from 'zod';
+The `EmitFn` inside `withEmit` enforces: if `actor_type` is `'webhook'`, `'cron'`, `'agent'`, or `'migration'`, the `idempotency_key` field is required at compile time (typed as non-optional for those actor types). Omitting it is a TypeScript error, not a runtime check.
 
-export type EventInput<T extends EventType> = {
-  event_type: T;
-  subject_type: SubjectType;
-  subject_id: string;
-  actor_type: ActorType;
-  actor_id?: string;
-  payload: EventPayload<T>;
-  caused_by?: string[];
-  idempotency_key?: string;  // REQUIRED when actor_type IN ('webhook','cron','agent','migration')
-};
-
-const requiresIdempotencyKey = (actor_type: ActorType) =>
-  ['webhook', 'cron', 'agent', 'migration'].includes(actor_type);
-
-export async function emit<T extends EventType>(input: EventInput<T>): Promise<{ event_id: string }> {
-  // 1. Required idempotency_key for retry-capable actors
-  if (requiresIdempotencyKey(input.actor_type) && !input.idempotency_key) {
-    throw new EmitError(`idempotency_key required for actor_type=${input.actor_type}`);
-  }
-
-  // 2. Validate payload against the event_type's Zod schema
-  const schema = eventSchemas[input.event_type];
-  const validated = schema.parse(input.payload);
-
-  // 3. Begin transaction, insert event + outbox atomically
-  return await supabaseAdmin.rpc('emit_event', { /* ... */ });
-}
-```
-
-#### Typed idempotency-key factories (v1.1 — namespace collision impossible)
+#### Typed idempotency-key factories (namespace collision impossible)
 
 Every idempotency-key-producing source has a typed factory function with a mandatory namespace prefix. Convention drift is impossible by construction.
 
@@ -835,9 +912,46 @@ export function cronIdempotencyKey(jobName: string, dateBucket: string): string 
   return `cron:${jobName}:${dateBucket}`;
 }
 
-/** Agent invocations — per engagement + requirement + day */
-export function agentEvalIdempotencyKey(engagementId: string, requirementKey: string, dayBucket: string): string {
-  return `agent:eval:${engagementId}:${requirementKey}:${dayBucket}`;
+/**
+ * Agent invocations — per engagement + requirement + CONTEXT FINGERPRINT (v1.2 🔴 Fix 6).
+ *
+ * v1.1 used a UTC day bucket: `agent:eval:ENG:req:2026-04-22`.
+ * PROBLEM: if context changes mid-day (new member added, exception granted, payment confirmed,
+ * spec override effective-from hit), the same key is generated → Inngest dedupes the dispatch
+ * → no re-evaluation until midnight UTC → per-member requirements for the new member are silently
+ * never computed for up to 24 hours.
+ *
+ * v1.2 fix: key includes a fingerprint of evaluation-relevant context. Any context change
+ * generates a new key and forces a fresh dispatch. A separate dispatch-throttle table
+ * (min N minutes between dispatches of the same fingerprint) controls cost without a blunt
+ * 24h window.
+ */
+export function agentEvalIdempotencyKey(
+  engagementId: string,
+  requirementKey: string,
+  contextFingerprint: string,  // hash(sorted active_member_ids + max_event_id + sorted active_exception_ids + spec_version)
+): string {
+  return `agent:eval:${engagementId}:${requirementKey}:${contextFingerprint}`;
+}
+
+/**
+ * Compute the context fingerprint for an engagement's ai_evaluable requirement.
+ * Called immediately before dispatch; any state change produces a new fingerprint.
+ */
+export async function computeEvalContextFingerprint(engagementId: string): Promise<string> {
+  const [members, maxEvent, exceptions, engagement] = await Promise.all([
+    db.account_members.findMany({ where: { account_id: '...', left_at: null }, select: { contact_id: true } }),
+    db.events.aggregate({ _max: { id: true }, where: { subject_id: engagementId } }),
+    db.exceptions.findMany({ where: { engagement_id: engagementId, status: 'active' }, select: { id: true } }),
+    db.engagements.findUnique({ where: { id: engagementId }, select: { spec_version: true } }),
+  ]);
+  const raw = [
+    members.map(m => m.contact_id).sort().join(','),
+    maxEvent._max.id ?? '0',
+    exceptions.map(e => e.id).sort().join(','),
+    String(engagement.spec_version),
+  ].join('|');
+  return createHash('sha256').update(raw).digest('hex').slice(0, 16);
 }
 
 /** Agent proposals — per engagement + action_type + hash of parameters */
@@ -866,7 +980,7 @@ The `emit_event` Postgres function wraps both inserts in a single transaction an
 
 **[R101-FLAG on GDPR compatibility.]** Events are append-only. If a client requests GDPR deletion, and their PII sits in event payloads, you cannot comply without breaking the append-only invariant or leaving orphan tokens.
 
-The resolution: PII in event payloads is always a token. Raw values live in `sensitive_data` with a per-row RLS policy and an explicit deletion path. GDPR deletion wipes the `sensitive_data` rows; the event payloads retain tokens that now resolve to `(deleted)`. Audit trail is preserved; PII is gone. This pattern is documented and implemented from day one in Section 14.
+The resolution: PII in event payloads is always a token. Raw values live in `sensitive_data` with a per-row RLS policy and an explicit deletion path. GDPR deletion soft-deletes `sensitive_data` rows (sets `encrypted_value = NULL`, `deleted_at = now()` — hard-delete is impossible due to FK constraints from `contacts`). Event payloads retain tokens that now resolve to `(Deleted)` at render time. Audit trail is preserved; PII is unrecoverable. Section 14.4 details this. This pattern is implemented from day one.
 
 **[R101-FLAG on event schema evolution.]** What happens when we need to evolve an event type's payload? Example: `payment.confirmed` initially has `{ amount, currency, method, invoice_number }`. Later we need `platform_fee`, `net_amount`, `processor_fee`. Every historical event now has an incomplete payload.
 
@@ -2266,7 +2380,7 @@ Each editable value has: current effective value, current override (if any), pro
 
 **Version history:** see what changed, when, who changed it. Full audit trail via `spec.updated` + `rule_override.created` events.
 
-### 11.4 Proposal inbox — REVISED v1.1 (🟠 Fix E: evidence_event_hash optimistic concurrency)
+### 11.4 Proposal inbox — REVISED v1.2 (🔴 Fix 1: evidence_event_hash inverted predicate)
 
 A dedicated page at `/admin/proposals` for AI-generated proposals.
 
@@ -2275,7 +2389,9 @@ A dedicated page at `/admin/proposals` for AI-generated proposals.
 - Each proposal shows: action type, target account/engagement, rationale, confidence, evidence events (expandable), blast_radius, alternative considered, weakness acknowledged, scar matches.
 - One-click approve or reject with optional reason.
 
-**🟠 Fix E — Stale-render guard (`evidence_event_hash`).** Every proposal is generated from a snapshot of the engagement's event history. If that history changes between proposal generation and admin approval (a new event arrives — payment confirmed, document uploaded, exception granted — that would have changed what the agent proposed), the admin is acting on stale evidence. This is a known failure mode in any human-in-the-loop system: the supervisor approves an action based on state that has already changed.
+**🔴 Fix 1 — Stale-render guard (`evidence_event_hash`).** Every proposal is generated from a snapshot of the engagement's event history. If that history changes between proposal generation and admin approval (a new event arrives — payment confirmed, document uploaded, exception granted — that would have changed what the agent proposed), the admin is acting on stale evidence. This is a known failure mode in any human-in-the-loop system: the supervisor approves an action based on state that has already changed.
+
+**v1.1 had a tautological bug.** The original check queried events with `created_at ≤ proposal.generated_at` — identical to the event set used when the proposal was generated. The hash therefore always matched. The guard never fired. Fix: check for the existence of any events with `created_at > proposal.generated_at`. If any exist, the proposal is stale — regardless of whether those events affect this engagement directly (a shared spec change or a linked contact event can invalidate solver output across engagements). The guard now correctly detects state change, not same-state recomputation.
 
 ```typescript
 type AIProposal = {
@@ -2286,22 +2402,48 @@ type AIProposal = {
   generated_at: TIMESTAMPTZ;
 };
 
-// On admin approval:
+// On admin approval — CORRECTED v1.2: check for NEW events after proposal.generated_at
 async function approveProposal(proposalId: string, adminUserId: string) {
   const proposal = await db.proposals.findUnique({ where: { id: proposalId } });
-  
-  // Recompute hash from current events:
-  const currentEvents = await db.events.findMany({
-    where: { subject_id: proposal.engagement_id, created_at: { lte: proposal.generated_at } }
+
+  // Fetch any events that arrived AFTER proposal generation.
+  // Includes: (a) direct engagement events, and (b) events in the solver invalidation
+  // scope (e.g., spec change on a shared contract type, exception on a linked contact).
+  const invalidationScope = await getSolverInvalidationScope(proposal.engagement_id);
+
+  const newEvents = await db.events.findMany({
+    where: {
+      created_at: { gt: proposal.generated_at },  // INVERTED from v1.1 lte → v1.2 gt
+      OR: [
+        { subject_id: proposal.engagement_id },
+        { subject_id: { in: invalidationScope } },  // cross-engagement scope
+      ],
+    },
+    select: { id: true },
+    take: 1,  // existence check only — no need to load all
   });
-  const currentHash = computeEvidenceHash(currentEvents.map(e => e.id));
-  
-  if (currentHash !== proposal.evidence_event_hash) {
+
+  if (newEvents.length > 0) {
     throw new StaleProposalError(
       'New events arrived since this proposal was generated. Refresh the page to see the updated state before approving.'
     );
   }
   // proceed with approval
+}
+
+// getSolverInvalidationScope returns IDs of entities whose state changes
+// can affect this engagement's solver output: shared spec versions, contact IDs
+// with active memberships, any linked engagement sharing the same contact.
+async function getSolverInvalidationScope(engagementId: string): Promise<string[]> {
+  const engagement = await db.engagements.findUnique({
+    where: { id: engagementId },
+    include: { account: { include: { members: { where: { left_at: null } } } } },
+  });
+  return [
+    engagement.spec_id,          // spec updates invalidate
+    engagement.account_id,       // account-level events invalidate
+    ...engagement.account.members.map(m => m.contact_id),  // member events invalidate
+  ];
 }
 ```
 
@@ -2420,10 +2562,52 @@ CREATE INDEX idx_exceptions_requirement_pattern ON exceptions(requirement_key, c
 5. Save → emits `exception.approved` + inserts row in `exceptions` (status='active').
 6. Solver cache invalidates for the affected engagement. Next solver call returns the requirement with `status='satisfied_by_exception'`. Downstream requirements unblock.
 
-**Expiration:**
-- Cron daily checks for `exceptions where status='active' and expires_at < now()`.
-- Emits `exception.expired` for each; updates row to `status='expired'`.
-- Solver re-evaluates; requirement reverts to previous status; downstream re-blocks.
+**Expiration — REVISED v1.2 (🟠 Fix 7: split-brain prevention):**
+
+The cron must update the row status AND emit `exception.expired` atomically. If the two operations are in separate transactions, a crash between them produces either: (a) the row marked expired but no event → solver does not re-evaluate → expired exception still treated as active → silent mis-state; or (b) the event emitted but the row not updated → event consumers see an expiry that the DB doesn't reflect → inconsistency.
+
+```typescript
+// All §16.4 crons use withEmit() — same atomicity contract as any other state change.
+// lib/workflows/exception-expirer.ts
+export const exceptionExpirer = inngest.createFunction(
+  { id: 'exception-expirer' },
+  { cron: '30 0 * * *' },  // daily 00:30 UTC
+  async ({ step }) => {
+    const expiredIds = await step.run('find-expired', async () => {
+      const { data } = await supabaseAdmin
+        .from('exceptions')
+        .select('id, engagement_id')
+        .eq('status', 'active')
+        .lt('expires_at', new Date().toISOString());
+      return data ?? [];
+    });
+
+    for (const exc of expiredIds) {
+      await step.run(`expire-${exc.id}`, async () => {
+        await withEmit(async (emit) => {
+          // State update and event emission in one atomic transaction:
+          await supabaseAdmin
+            .from('exceptions')
+            .update({ status: 'expired', expired_at: new Date() })
+            .eq('id', exc.id);
+          await emit({
+            event_type: 'exception.expired',
+            actor_type: 'inngest',
+            subject_type: 'exception',
+            subject_id: exc.id,
+            idempotency_key: `exception.expired:${exc.id}`,
+            payload: { exception_id: exc.id, engagement_id: exc.engagement_id },
+          });
+        });
+      });
+    }
+  }
+);
+```
+
+Solver re-evaluates on `exception.expired`; requirement reverts to previous status; downstream re-blocks.
+
+**Rule:** All §16.4 cron functions (exceptionExpirer, reminderCadenceRunner, any future periodic state-changing crons) MUST use `withEmit()` for any operation that both changes state and emits an event. The pattern is not optional for these functions.
 
 **Revocation:**
 - Admin manually revokes an active exception via UI.
@@ -2660,6 +2844,10 @@ Raw PII never lives in event payloads, log lines, or most application tables. In
 **v1.1 expansion (fix for 🔴 Flaw B):** tokenization covers `contact_name`, `contact_email`, and `contact_phone` in addition to the structured identifiers. v1.0 treated names/emails as "normal columns" — that was a GDPR gap on the input side of agents (agents saw raw names in context bundles).
 
 ```sql
+-- REVISED v1.2 (🔴 Fix 4): encrypted_value is NULLABLE to support GDPR soft-delete.
+-- Rows are NEVER hard-deleted (FK integrity from contacts.name_token etc. would throw).
+-- GDPR deletion sets encrypted_value = NULL + deleted_at = now(). Token stays valid.
+-- get_sensitive_value() returns NULL when encrypted_value IS NULL; callers display '(Deleted)'.
 CREATE TABLE sensitive_data (
   token             TEXT PRIMARY KEY,                     -- opaque, e.g., 'token:contact:name:a7f8c2b1' or 'token:passport:f3a9...'
   subject_type      TEXT NOT NULL,                        -- 'contact' | 'account' | 'engagement'
@@ -2668,9 +2856,11 @@ CREATE TABLE sensitive_data (
     'contact_full_name','contact_first_name','contact_last_name','contact_email','contact_email_2','contact_phone','contact_phone_2',
     'passport_number','itin','ein','ssn','dob','address','bank_account'
   )),
-  encrypted_value   TEXT NOT NULL,                        -- pgcrypto AES-256 encrypted
-  value_hash        TEXT NOT NULL,                        -- SHA-256 hash for lookup without decryption
+  encrypted_value   TEXT,                                 -- pgcrypto AES-256 encrypted; NULL = GDPR-deleted
+  value_hash        TEXT,                                 -- SHA-256 hash for lookup; NULL after deletion
   created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  deleted_at        TIMESTAMPTZ,                          -- GDPR deletion timestamp; NULL = live
+  deleted_by        UUID REFERENCES auth.users(id),       -- who triggered GDPR deletion
   last_accessed_at  TIMESTAMPTZ,
   access_count      INTEGER NOT NULL DEFAULT 0,
   created_by        UUID NOT NULL
@@ -2726,7 +2916,7 @@ Not `{ "ein_number": "12-3456789" }`. Never.
 **Agent context bundles always use tokens.** `TokenizedContactRecord` (§8.3) replaces raw `ContactRecord`. Agents NEVER see decrypted PII.
 
 **Reading PII (the narrow authorized path):**
-- `get_sensitive_value(token, purpose)` Postgres function — takes a token + a documented purpose string, checks the caller's role, logs the access (`access_count++`, `last_accessed_at`), decrypts and returns.
+- `get_sensitive_value(token, purpose)` Postgres function — takes a token + a documented purpose string, checks the caller's role, logs the access (`access_count++`, `last_accessed_at`), decrypts and returns. **v1.2:** if `encrypted_value IS NULL` (GDPR-deleted), returns `NULL` without logging an access (nothing to log). Callers treat a `NULL` return as `'(Deleted)'` at the display layer.
 - Application code uses this function ONLY when PII is actually needed:
   - **UI rendering** (admin sees "Marco Rossi" on a client page; portal sees the client's own name).
   - **Signed document generation** (SS-4, OA, Lease embed the real name).
@@ -2820,19 +3010,23 @@ A forged webhook is rejected *before* any `emit()` call. Rejection logs with `we
 
 Secret rotation: each secret is stored in Supabase Vault (not .env). Rotation is an ops task with a documented procedure. Stripe and Whop support webhook secret rotation with grace periods; we use the grace period to rotate without downtime.
 
-### 14.4 GDPR deletion — REVISED v1.1 (structurally complete with tokenized names)
+### 14.4 GDPR deletion — REVISED v1.2 (soft-delete on sensitive_data, not hard-delete; 🔴 Fix 4)
+
+**Why hard-delete is impossible:** `contacts.full_name_token TEXT NOT NULL REFERENCES sensitive_data(token)`. Attempting to `DELETE FROM sensitive_data` where that token is referenced throws a FK violation under `ON DELETE NO ACTION` (Postgres default). The contacts row stays; the FK is live; the delete is blocked. GDPR compliance would fail on the first attempt.
+
+**v1.2 fix — soft-delete:** GDPR deletion sets `encrypted_value = NULL` and `deleted_at = now()` on each targeted `sensitive_data` row. The row stays (FK integrity preserved). The token stays valid. `get_sensitive_value(token)` returns `NULL` when `encrypted_value IS NULL`. Display layer renders `(Deleted)` or equivalent. The value is permanently unrecoverable — the encryption key is discarded and the plaintext is gone — but the row exists as a tombstone, keeping all FKs valid.
 
 When a contact requests GDPR deletion:
 
 1. Admin initiates the deletion workflow via CRM (not exposed to clients directly — verify identity first).
 2. A workflow (Inngest) runs:
-   a. Identify all `sensitive_data` rows for the contact (structured identifiers, names, emails, phones, addresses). Delete.
-   b. `contacts` row stays (referential integrity) — tokens now reference deleted sensitive_data rows; `resolve_token()` returns `(deleted)` for display.
-   c. Emit `contact.gdpr_deleted` event (not `contact.deleted` — the reference still exists in events for audit).
-   d. Notify any downstream systems (QuickBooks, Stripe, Whop) where the contact may have records; initiate per-provider deletion via their APIs.
-3. Event payloads referencing the contact via tokens still exist; tokens resolve to `(deleted)` at render time. Audit trail is preserved; raw PII is gone.
+   a. Identify all `sensitive_data` rows for the contact (`subject_id = contact.id`). Set `encrypted_value = NULL`, `value_hash = NULL`, `deleted_at = now()`, `deleted_by = admin_user_id`.
+   b. `contacts` row stays — tokens still reference `sensitive_data` rows (FK valid); `get_sensitive_value()` returns `NULL`; display shows `(Deleted)`.
+   c. Emit `contact.gdpr_deleted` event. The token references in the event payload now resolve to `(Deleted)` at render time. Audit trail preserved; raw PII gone.
+   d. Notify downstream systems (QuickBooks, Stripe, Whop); initiate per-provider deletion via their APIs.
+3. Downstream: event payloads referencing this contact via tokens still exist. All tokens resolve to `(Deleted)` at render time. No event is mutated; the append-only invariant holds.
 
-**Why v1.1's structural tokenization makes this clean:** v1.0's free-form agent reasoning ("Marco Rossi has been waiting 10 days") would have survived deletion as orphan PII. v1.1's template-slot outputs contain only tokens, so deletion of sensitive_data automatically redacts the rendered form. No post-hoc scrubbing of event payloads is required.
+**Why v1.2's structural tokenization makes this clean:** free-form agent reasoning ("Marco Rossi has been waiting 10 days") would survive deletion as orphan PII. v1.1+ template-slot outputs contain only tokens, so soft-nulling the `sensitive_data` rows automatically redacts all rendered forms — admin views, portal views, archived proposals, and historical event audit pages all show `(Deleted)` for deleted contacts. No post-hoc scrubbing of event payloads is required.
 
 **Secondary control for any remaining free-form fields** (e.g., exception reasons typed by admins, chat messages): pre-emit NER + regex scrubber runs at `emit()` entry. Detected names, emails, phone numbers, addresses in free-form fields are replaced with tokens before the event is written. This catches the residual gap that structure alone doesn't close.
 
@@ -3004,36 +3198,69 @@ Beyond structured output, every response is validated in application code:
    - `reasoning` length is enforced.
 3. **Scar cross-check**: if the proposal's scar_matches reference scars with preventions that the current state doesn't satisfy, the proposal is flagged for human review regardless of confidence.
 
-### 15.6 Calibration loop — REVISED v1.1 (Bayesian sequential, not weekly batch)
+### 15.6 Calibration loop — REVISED v1.2 (🟠 Fix 9: admin_approved ≠ outcome_correct)
 
-Model confidence is notoriously miscalibrated (reported 0.9 ≠ actual 0.9 accuracy). The calibration loop measures and corrects. **v1.1 replaces the weekly batch analysis with a Bayesian sequential test** that detects calibration drift within hours of evidence accumulating — regardless of whether a full week's data has arrived.
+Model confidence is notoriously miscalibrated (reported 0.9 ≠ actual 0.9 accuracy). The calibration loop measures and corrects. **v1.1 replaced weekly batch analysis with a Bayesian sequential test.** **v1.2 fixes the feedback signal**: v1.1 conflated `admin_approved` with correctness, creating a rubber-stamp loop — if admins routinely approve proposals without scrutiny, the model learns "approved = correct" and thresholds drift downward as quality silently degrades.
+
+**Two distinct signals — never conflated:**
+
+| Signal | What it means | When available | Used for |
+|--------|--------------|----------------|---------|
+| `admin_approved` | Admin clicked Approve | Immediately on approval | Workflow trigger only — does NOT feed calibration |
+| `outcome_correct` | The action produced the intended outcome | Materialized later (hours to days) | Calibration input — only signal that feeds Beta update |
+
+`outcome_correct` is set by domain logic, not admin opinion:
+- For email reminders: did the client respond or complete the action within the expected window? (set by a Inngest follow-up step N days later)
+- For document request proposals: did the submitted document satisfy the requirement? (set when solver transitions requirement to `satisfied`)
+- For exception recommendations: did the engagement proceed without a re-block? (set 30 days post-exception)
+- For triage / classification: did the engagement follow the predicted path? (set at engagement.completed or first manual re-classification)
+
+Until `outcome_correct` is materialized, the observation is pending and does not update any Beta distribution. An observation that never resolves (e.g. engagement still open after 6 months) is excluded from calibration permanently.
 
 **Data collection:** for each proposal or AI decision, we record:
 - The confidence the model reported.
-- The admin's ultimate disposition (approved / rejected) or the outcome (was the decision correct in retrospect).
+- `admin_approved` (boolean) — records the human action, not the correctness.
+- `outcome_correct` (boolean | null) — null until materialized by domain logic.
 - Task type, model used, context bundle size, scar matches.
 
-**Bayesian sequential calibration:**
+**Bayesian sequential calibration (runs on `outcome_correct` observations only):**
 
 For each `(task_type, model, confidence_bucket)` tuple, maintain a Beta distribution `Beta(α, β)` where:
-- `α` = successes (admin approved / outcome correct) + 1 (uninformative prior)
-- `β` = failures (admin rejected / outcome incorrect) + 1 (uninformative prior)
+- `α` = outcomes correct + 1 (uninformative prior)
+- `β` = outcomes incorrect + 1 (uninformative prior)
 
-On each new observation, update `α` or `β`. After each update:
+On each new `outcome_correct` observation, update `α` or `β`. After each update:
 1. Compute posterior mean accuracy: `α / (α + β)`.
 2. Compute the 95% credible interval.
 3. **If** posterior mean diverges from target by > 10% **AND** credible interval width < 0.15: fire an alert and adjust the auto-execution threshold incrementally.
 
 This alerts within hours of sufficient evidence accumulating — not after a weekly batch. At low volumes, the credible interval is wide and no adjustment fires; the prior dominates safely. As volume grows, the CI narrows and adjustments become precise.
 
-**Minimum evidence before any threshold adjustment:** 20 observations per bucket. Below 20, the prior dominates and the estimate is conservative by design.
+**Minimum evidence before any threshold adjustment:** 20 resolved `outcome_correct` observations per bucket. Below 20, the prior dominates and the estimate is conservative by design.
+
+**Why this matters:** if admins batch-approve 40 proposals at once ("the rubber-stamp session"), all 40 fire `admin_approved=true`. Under v1.1, all 40 would immediately update the Beta distribution toward "correct." Under v1.2, those 40 are pending until their domain outcomes resolve — some may set `outcome_correct=false` when clients don't respond or requirements re-block. The calibration reflects actual effectiveness, not admin approval behavior.
 
 **Example outcome:**
 - Task: "Classify inbound email to engagement", Model: Haiku 4.5.
 - Initial auto-route threshold: 0.9 reported confidence.
-- After 150 observations (reports 0.9+): 102 approved, 48 rejected.
-- Posterior mean = 0.68. 95% CI width = 0.14 → drift confirmed. Alert fires within hours of the 150th observation.
+- After 150 resolved outcomes (not approvals): 102 correct, 48 incorrect.
+- Posterior mean = 0.68. 95% CI width = 0.14 → drift confirmed. Alert fires within hours of the 150th resolved outcome.
 - Threshold adjusted to 0.95 reported confidence to achieve target 0.68+ actual.
+
+**Schema addition (v1.2):**
+```sql
+ALTER TABLE calibration_observations
+  ADD COLUMN admin_approved    BOOLEAN,
+  ADD COLUMN admin_approved_at TIMESTAMPTZ,
+  ADD COLUMN outcome_correct   BOOLEAN,          -- NULL until materialized
+  ADD COLUMN outcome_set_at    TIMESTAMPTZ,
+  ADD COLUMN outcome_set_by    TEXT;             -- which domain logic set it (e.g. 'solver:requirement_satisfied')
+
+-- Partial index: calibration queries only resolved observations
+CREATE INDEX idx_calibration_resolved
+  ON calibration_observations(task_type, model, confidence_bucket)
+  WHERE outcome_correct IS NOT NULL;
+```
 
 This calibration data is stored in `calibration_metrics` table (with per-bucket Beta parameters) and drives `calibrated_threshold_per_task` config that the agent dispatch reads on every call.
 
