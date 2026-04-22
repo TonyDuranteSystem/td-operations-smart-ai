@@ -1,8 +1,8 @@
 # Smart AI TD Operations — Architecture Plan
 
-**Version:** 1.3 — Post-Round 4 adversarial review (final)
-**Date:** 2026-04-22 (v1.3 revision); v1.2 same date; v1.1 same date; 2026-04-21 (v1.0)
-**Status:** Pre-build. Four rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
+**Version:** 1.4 — Post-Round 5 adversarial review (final)
+**Date:** 2026-04-22 (v1.4 revision); v1.3 same date; v1.2 same date; v1.1 same date; 2026-04-21 (v1.0)
+**Status:** Pre-build. Five rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
 
 ## v1.2 Changelog — What Changed Since v1.0
 
@@ -69,6 +69,27 @@
 | 🟠 6. `reasoning_template_id: z.enum([...generated...])` is built at compile time; adding a DB template at runtime leaves it outside the enum; agent cannot select it without a redeploy | Template catalog claims "no code change to add a template" but requires schema regeneration + deploy for every addition | **Change to `z.string().uuid()`; validate template ID against DB at agent invocation time (60s cache); CI check becomes "all pinned template references still exist in DB," not "DB state is in the enum"** |
 | 🟠 7. `client_routing.contact_id REFERENCES contacts(id)` — FK across two Supabase projects is impossible; v1 and v2 are separate Postgres instances | Any single-database table placement leaves the other system without FK integrity or requires expensive cross-project HTTP on every offer | **Drop FK; use email hash as routing key (no referential integrity across projects — expected); table lives in v2; v1 reads via lightweight HTTP call to v2 routing endpoint** |
 | 🟡 8. Batch API savings math double-counted; document subtracts full 10%-of-total as discount instead of 50%-of-10%-of-total | Cost estimate at 225 clients understated by ~$39/month; error compounds at scale | **Fix: savings = 10% × $785 × 50% = $39; correct total = $785 − $39 = **$746/month**; all downstream scale references updated** |
+
+### Round 5 (fifth reviewer, architecture-only): 6 load-bearing flaws + 6 significant
+
+| Flaw | Consequence | Fix |
+|---|---|---|
+| 🔴 F1. `emit_event_atomic` runs UPDATE before idempotency check | Webhook retries with same key still mutate entity; later state changes silently overwritten | **Move idempotency SELECT to top of function; return existing event_id before any UPDATE** |
+| 🔴 F2. `events` table missing `account_id`; `actor_type` CHECK excludes `'inngest'` and `'admin'` | First `emit_event_atomic` call fails: column-not-found or CHECK violation | **Add `account_id UUID` to `events` and `outbox`; expand CHECK to include `'inngest'` and `'admin'`** |
+| 🔴 F3. Solver dispatch call site still passes `dayBucket`; Round 3 Fix 6 applied to factory signature but not to the call | Same 24h staleness failure mode as pre-Fix 6; TypeScript silently accepts `string` for `contextFingerprint` | **Replace `const dayBucket = todayISO()` with `const fp = await computeEvalContextFingerprint(engagement.id)`** |
+| 🔴 F4. `recommendation_template_id: z.enum([...])` hardcoded; Round 4 Fix 6 missed this sibling field | Adding a new recommendation template requires a code change + deploy; contradicts §8.5.1 runtime-editability promise | **Change to `z.string().uuid()`; validate against `recommendation_templates` DB table via same 60s LRU pattern** |
+| 🔴 F5. §15.4 Anthropic tool `input_schema` uses free-form `reasoning: { type: 'string' }` — v1.0 schema; contradicts §8.5 template-slot Fix B | Implementers following §15.4 verbatim undo Round 2 Fix B; model writes PII into `ai.decision` payloads that survive GDPR deletion | **Replace §15.4 example with template-slot version derived from §8.5 Zod schema; add CI assertion that Anthropic tool schema equals Zod schema** |
+| 🔴 F6. `dispatch_throttle` table referenced in Round 3 Fix 6 and §7.2 cost rationale but never defined anywhere | Without throttle, context-fingerprint dispatch fires on every state change; cost model's 10-calls/client/day assumption has no enforcement | **Define `dispatch_throttle(engagement_id, requirement_key, last_dispatched_at, context_fingerprint)` with 5-minute minimum interval; check-and-upsert before `inngest.send()`** |
+| 🟠 F7. `step.waitForEvent` on `per_member` requirement resolves on first member's event; semantics undefined | MMLLC formation proceeds to state filing after first passport received, not all; core multi-member case silently misbehaves | **Define `requirement.satisfied` semantics for `per_member` reqs: emits once when ALL members satisfied, with `all_members_satisfied: true, member_count: N` in payload** |
+| 🟠 F8. Idempotency SELECT-then-INSERT with no concurrent-write handler; two simultaneous retries crash one | Under concurrent webhook retries, one INSERT hits UNIQUE violation and errors; not handled | **Use `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`; SELECT on empty return** |
+| 🟠 F9. `emit_event_atomic` is `SECURITY DEFINER` with no `REVOKE`; any portal-authenticated user can call it | Portal user can bypass RLS on any supported entity table via direct `supabase.rpc('emit_event_atomic', ...)` | **`REVOKE EXECUTE FROM PUBLIC, anon, authenticated; GRANT EXECUTE TO service_role`** |
+| 🟠 F10. Pre-emit PII scrubber (`scrubPayloadForPII`) defined in §14.4 but never called from `withEmit()` | Free-form fields (exception reasons, chat) flow into events unscrubbed; named deleted contacts survive as orphan PII | **Add `const scrubbed = await scrubPayloadForPII(input.event_type, validatedPayload)` between Zod parse and `rpc()` call** |
+| 🟠 F11. Exception-expirer emits `account_id: exc.account_id` but `exceptions` table has no `account_id`; SELECT only fetches `id, engagement_id` | `exc.account_id` is `undefined`; drain's account-channel broadcast skipped; exception expirations never reach CRM account view | **JOIN `engagements` in expirer SELECT to get `account_id`; pass to `withEmit()`** |
+| 🟠 F12. `rule_overrides.effective_from` has no DB-level lower bound; backdated overrides bypass Round 2 Fix A's price-protection guarantee | Admin (or malformed form) setting past `effective_from` retroactively changes contracted prices — the exact failure Fix A was designed to prevent | **Add `CHECK (effective_from >= created_at)` on `rule_overrides`; server-side API rejects backdated values without explicit owner-role override** |
+
+### What v1.4 adds by way of scar protection
+
+Every Round 5 flaw is a scar: idempotency-order inversion, schema-code mismatch, call-site propagation failure, sibling-field propagation failure, contradictory example schemas, referenced-but-undefined tables, per-member event semantics ambiguity, concurrent-write missing handler, SECURITY DEFINER without REVOKE, belt-and-suspenders control as dead code, entity-join missing from cron, DB constraint weaker than documented invariant. Future designs check against these before shipping.
 
 ### What v1.3 adds by way of scar protection
 
@@ -591,12 +612,15 @@ Every meaningful change in the system produces an event. Events are append-only 
 ### 5.1 Event schema
 
 ```sql
+-- REVISED v1.4 (🔴 F2/Round 5): added account_id (required by emit_event_atomic and drain);
+-- expanded actor_type CHECK to include 'inngest' and 'admin' (used throughout codebase).
 CREATE TABLE events (
   id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   event_type        TEXT NOT NULL,               -- e.g., 'payment.confirmed', 'member.added', 'document.uploaded'
   subject_type      TEXT NOT NULL,               -- e.g., 'engagement', 'account', 'contact', 'service_delivery'
   subject_id        UUID NOT NULL,
-  actor_type        TEXT NOT NULL CHECK (actor_type IN ('human','agent','webhook','cron','system','migration')),
+  account_id        UUID,                        -- denormalized for drain broadcast and dashboard queries
+  actor_type        TEXT NOT NULL CHECK (actor_type IN ('human','agent','webhook','cron','system','migration','inngest','admin')),
   actor_id          TEXT,                        -- user UUID for human, 'ops_agent' for agent, webhook provider name for webhook, cron job name for cron
   payload           JSONB NOT NULL,              -- typed per event_type (see §5.3)
   caused_by         UUID[] DEFAULT '{}',         -- event IDs that caused this one (for chain tracing)
@@ -625,9 +649,15 @@ The original Smart-AI plan said "emit writes the event to the events table atomi
 **The outbox pattern:**
 
 ```sql
+-- REVISED v1.4 (🔴 F2/Round 5): added account_id and subject_type/subject_id so the drain
+-- can compute engagement-scoped and account-scoped Realtime channels without joining events.
 CREATE TABLE outbox (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   event_id        UUID NOT NULL UNIQUE REFERENCES events(id),
+  event_type      TEXT NOT NULL,                -- denormalized from events for drain routing
+  subject_type    TEXT NOT NULL,                -- denormalized — drain uses this to inject engagement_id
+  subject_id      UUID NOT NULL,                -- denormalized — drain injects as engagement_id when subject_type='engagement'
+  account_id      UUID,                         -- denormalized — drain uses for account-channel broadcast
   status          TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','publishing','published','failed')),
   attempts        INTEGER NOT NULL DEFAULT 0,
   last_error      TEXT,
@@ -767,7 +797,8 @@ Events are organized by domain. The catalog below is the first-cutover set (Stag
 - `document.expired` — deadline-bound document passes expiry. Payload: `{ doc_type, expired_at }`.
 
 **Requirement lifecycle:**
-- `requirement.satisfied` — a spec requirement is now met. Payload: `{ requirement_key, evidence_event_id, spec_id }`.
+- `requirement.satisfied` — a spec requirement is now met. Payload: `{ requirement_key, evidence_event_id, spec_id, per_member: boolean, all_members_satisfied: boolean, member_count: number | null }`.
+  **Per-member semantics — REVISED v1.4 (🟠 F7/Round 5).** For `per_member: true` requirements (e.g. `member_passport`), this event fires ONCE — only when ALL active members have satisfied the requirement, not on each individual member's satisfaction. `all_members_satisfied: true` and `member_count: N` are included in the payload. `step.waitForEvent(if: 'event.data.requirement_key == "member_passport"')` therefore resolves only on full-group completion, not on the first member's upload — preventing the MMLLC formation pipeline from advancing to state filing with incomplete member docs. The solver tracks per-member progress internally (via `requirement_scope` in the per-member tracking table) and emits `requirement.satisfied` only when the per-member count matches the active member count. If a new member is added after partial satisfaction, the event is not re-emitted until the new member also satisfies it.
 - `requirement.unsatisfied` — a previously satisfied requirement is no longer met (e.g., a member leaves, a document expires). Payload: `{ requirement_key, reason }`.
 - `requirement.blocked` — payload: `{ requirement_key, blocked_by: [requirement_keys] }`.
 - `requirement.ai_evaluation_needed` — the solver flagged this requirement as requiring AI evaluation. Payload: `{ requirement_key, context }`.
@@ -830,44 +861,71 @@ CREATE OR REPLACE FUNCTION emit_event_atomic(
 LANGUAGE plpgsql
 SECURITY DEFINER AS $$
 DECLARE
-  v_event_id UUID := gen_random_uuid();
+  v_event_id UUID;
 BEGIN
-  -- 1. Apply entity update (supported tables only — no dynamic SQL for security)
-  IF p_entity_table = 'engagements' THEN
-    UPDATE engagements
-    SET status      = COALESCE((p_entity_update->>'status'), status),
-        started_at  = COALESCE((p_entity_update->>'started_at')::TIMESTAMPTZ, started_at),
-        completed_at = COALESCE((p_entity_update->>'completed_at')::TIMESTAMPTZ, completed_at)
-        -- additional columns added as the schema grows
-    WHERE id = p_entity_pk;
-  ELSIF p_entity_table = 'exceptions' THEN
-    UPDATE exceptions
-    SET status     = COALESCE((p_entity_update->>'status'), status),
-        expired_at = COALESCE((p_entity_update->>'expired_at')::TIMESTAMPTZ, expired_at)
-    WHERE id = p_entity_pk;
-  -- ELSIF p_entity_table = 'service_deliveries' THEN ...
-  -- Additional tables registered here as Stage 0+ schemas are built.
-  END IF;
-
-  -- 2. Idempotency check: if this key already exists, return the existing event_id
+  -- 1. IDEMPOTENCY CHECK FIRST — before any entity mutation (🔴 F1/Round 5).
+  --    v1.3 ran the UPDATE before this check; a retried webhook with the same key
+  --    would mutate the entity even if the event already existed, silently overwriting
+  --    any state change made between the original call and the retry.
   IF p_idempotency_key IS NOT NULL THEN
     SELECT id INTO v_event_id FROM events WHERE idempotency_key = p_idempotency_key;
     IF FOUND THEN
-      RETURN v_event_id;
+      RETURN v_event_id;  -- already processed; return existing event_id, touch nothing
     END IF;
-    v_event_id := gen_random_uuid();  -- fresh for new event
   END IF;
 
-  -- 3. Insert event
-  INSERT INTO events (id, event_type, actor_type, subject_type, subject_id, account_id, payload, idempotency_key)
-  VALUES (v_event_id, p_event_type, p_actor_type, p_subject_type, p_subject_id, p_account_id, p_payload, p_idempotency_key);
+  v_event_id := gen_random_uuid();
 
-  -- 4. Insert outbox (triggers drain)
-  INSERT INTO outbox (event_id, status) VALUES (v_event_id, 'pending');
+  -- 2. Apply entity update (supported tables only — no dynamic SQL for security).
+  --    Only reached if no existing idempotency key found above.
+  IF p_entity_table IS NOT NULL THEN
+    IF p_entity_table = 'engagements' THEN
+      UPDATE engagements
+      SET status       = COALESCE((p_entity_update->>'status'), status),
+          started_at   = COALESCE((p_entity_update->>'started_at')::TIMESTAMPTZ, started_at),
+          completed_at = COALESCE((p_entity_update->>'completed_at')::TIMESTAMPTZ, completed_at)
+      WHERE id = p_entity_pk;
+    ELSIF p_entity_table = 'exceptions' THEN
+      UPDATE exceptions
+      SET status     = COALESCE((p_entity_update->>'status'), status),
+          expired_at = COALESCE((p_entity_update->>'expired_at')::TIMESTAMPTZ, expired_at)
+      WHERE id = p_entity_pk;
+    -- ELSIF p_entity_table = 'service_deliveries' THEN ...
+    -- Additional tables registered here as Stage 0+ schemas are built.
+    END IF;
+  END IF;
+
+  -- 3. Insert event — ON CONFLICT handles concurrent retries atomically (🟠 F8/Round 5).
+  --    Two simultaneous webhook retries both pass the SELECT above (neither finds a row),
+  --    both attempt INSERT; one hits the UNIQUE constraint on idempotency_key.
+  --    ON CONFLICT DO NOTHING is safe here because the RETURNING clause returns NULL on
+  --    conflict, and we re-SELECT below to get the winning event_id.
+  INSERT INTO events (id, event_type, actor_type, subject_type, subject_id, account_id, payload, idempotency_key)
+  VALUES (v_event_id, p_event_type, p_actor_type, p_subject_type, p_subject_id, p_account_id, p_payload, p_idempotency_key)
+  ON CONFLICT (idempotency_key) DO NOTHING;
+
+  -- Re-SELECT if our INSERT lost the race (concurrent duplicate)
+  IF p_idempotency_key IS NOT NULL THEN
+    SELECT id INTO v_event_id FROM events WHERE idempotency_key = p_idempotency_key;
+  END IF;
+
+  -- 4. Insert outbox (triggers drain) — only if this call won the INSERT race.
+  INSERT INTO outbox (event_id, event_type, subject_type, subject_id, account_id, status)
+  VALUES (v_event_id, p_event_type, p_subject_type, p_subject_id, p_account_id, 'pending')
+  ON CONFLICT (event_id) DO NOTHING;  -- idempotent: if outbox row already exists, skip
 
   RETURN v_event_id;
 END;
 $$;
+
+-- 🟠 F9/Round 5: SECURITY DEFINER with no REVOKE means any authenticated portal user
+-- can call emit_event_atomic directly and bypass RLS on any supported entity table.
+-- Restrict to service_role only — the only caller path is server-side withEmit().
+REVOKE EXECUTE ON FUNCTION emit_event_atomic(TEXT,UUID,JSONB,TEXT,TEXT,TEXT,UUID,UUID,JSONB,TEXT) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION emit_event_atomic(TEXT,UUID,JSONB,TEXT,TEXT,TEXT,UUID,UUID,JSONB,TEXT) FROM anon;
+REVOKE EXECUTE ON FUNCTION emit_event_atomic(TEXT,UUID,JSONB,TEXT,TEXT,TEXT,UUID,UUID,JSONB,TEXT) FROM authenticated;
+GRANT  EXECUTE ON FUNCTION emit_event_atomic(TEXT,UUID,JSONB,TEXT,TEXT,TEXT,UUID,UUID,JSONB,TEXT) TO service_role;
+-- Add to migration checklist: this REVOKE must run at every migration that recreates the function.
 ```
 
 The JS wrapper validates before calling:
@@ -908,6 +966,12 @@ export async function withEmit(input: EmitInput): Promise<string> {
   const schema = eventSchemas[input.event_type];
   const validatedPayload = schema.parse(input.payload);  // Zod before any DB write
 
+  // 🟠 F10/Round 5: pre-emit PII scrubber was defined in §14.4 but never called here.
+  // Free-form fields (exception reasons, chat messages) would flow into events unscrubbed.
+  // scrubPayloadForPII runs NER + regex on declared free-form fields for this event type,
+  // replacing detected PII with tokens before the event is written to the DB.
+  const scrubbedPayload = await scrubPayloadForPII(input.event_type, validatedPayload);
+
   const { data: eventId, error } = await supabaseAdmin.rpc('emit_event_atomic', {
     p_entity_table:   input.entityWrite?.table ?? null,
     p_entity_pk:      input.entityWrite?.pk ?? null,
@@ -917,7 +981,7 @@ export async function withEmit(input: EmitInput): Promise<string> {
     p_subject_type:   input.subject_type,
     p_subject_id:     input.subject_id,
     p_account_id:     input.account_id ?? null,
-    p_payload:        validatedPayload,
+    p_payload:        scrubbedPayload,
     p_idempotency_key: input.idempotency_key ?? null,
   });
 
@@ -1063,6 +1127,71 @@ export async function computeEvalContextFingerprint(engagementId: string): Promi
 export function agentProposalIdempotencyKey(engagementId: string, actionType: string, paramsHash: string): string {
   return `agent:proposal:${engagementId}:${actionType}:${paramsHash}`;
 }
+```
+
+**dispatch_throttle table — REVISED v1.4 (🔴 F6/Round 5: table was referenced but never defined):**
+
+```sql
+-- Prevents burst dispatches when multiple events arrive in a short window.
+-- Without this, context-fingerprint dispatch fires an agent invocation on every state
+-- change mid-day. The cost model's ~10-calls/client/day assumption requires this throttle.
+CREATE TABLE dispatch_throttle (
+  engagement_id        UUID NOT NULL,
+  requirement_key      TEXT NOT NULL,
+  last_dispatched_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  context_fingerprint  TEXT NOT NULL,        -- fingerprint at time of last dispatch
+  PRIMARY KEY (engagement_id, requirement_key)
+);
+
+CREATE INDEX idx_dispatch_throttle_engagement ON dispatch_throttle(engagement_id);
+```
+
+```typescript
+// lib/agents/dispatch-throttle.ts
+const MINIMUM_DISPATCH_INTERVAL_MS = 5 * 60 * 1000;  // 5 minutes
+
+/**
+ * Returns true if the dispatch should be skipped (throttled).
+ * Returns false if the dispatch should proceed (and upserts the throttle row).
+ */
+export async function checkAndUpsertDispatchThrottle(
+  engagementId: string,
+  requirementKey: string,
+  contextFingerprint: string,
+): Promise<boolean> {
+  const existing = await supabaseAdmin
+    .from('dispatch_throttle')
+    .select('last_dispatched_at, context_fingerprint')
+    .eq('engagement_id', engagementId)
+    .eq('requirement_key', requirementKey)
+    .maybeSingle();
+
+  if (existing.data) {
+    const elapsed = Date.now() - new Date(existing.data.last_dispatched_at).getTime();
+    const fingerprintUnchanged = existing.data.context_fingerprint === contextFingerprint;
+
+    // Skip if: same fingerprint AND within minimum interval.
+    // Always dispatch if fingerprint changed — context change is always significant.
+    if (fingerprintUnchanged && elapsed < MINIMUM_DISPATCH_INTERVAL_MS) {
+      return true;  // throttled
+    }
+  }
+
+  // Proceed: upsert the throttle row
+  await supabaseAdmin
+    .from('dispatch_throttle')
+    .upsert({
+      engagement_id: engagementId,
+      requirement_key: requirementKey,
+      last_dispatched_at: new Date().toISOString(),
+      context_fingerprint: contextFingerprint,
+    }, { onConflict: 'engagement_id,requirement_key' });
+
+  return false;  // not throttled — proceed with dispatch
+}
+```
+
+```typescript
 
 /** Migration imports — per source system + source id */
 export function migrationIdempotencyKey(sourceSystem: 'v1' | 'airtable' | 'hubspot', sourceId: string): string {
@@ -1236,6 +1365,13 @@ Each engagement pins to a specific `(service_type, version)` at creation (`engag
 Some values in a spec are inherently variable — pricing, reminder cadences, grace periods, exception configurations. Antonio wants to edit these without a deploy. The `rule_overrides` table is where runtime edits live:
 
 ```sql
+-- REVISED v1.4 (🟠 F12/Round 5): added CHECK (effective_from >= created_at).
+-- Without this constraint, an admin (or a malformed CRM form) can set effective_from
+-- to a past date, retroactively capturing all engagements created after that date —
+-- including engagements that contracted at the old price. Round 2 Fix A's price-protection
+-- guarantee was a UI convention; this makes it a DB invariant.
+-- Exception path: owner role can explicitly backdate with allow_backdate=true + reason,
+-- enforced at the API layer — the DB constraint cannot be bypassed without service_role.
 CREATE TABLE rule_overrides (
   id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   spec_id         UUID NOT NULL REFERENCES service_specs(id),
@@ -1246,7 +1382,9 @@ CREATE TABLE rule_overrides (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   effective_from  TIMESTAMPTZ NOT NULL DEFAULT now(),  -- KEY: engagements created before this date do NOT see this override
   effective_to    TIMESTAMPTZ,                    -- NULL = indefinite
-  active          BOOLEAN NOT NULL DEFAULT true
+  active          BOOLEAN NOT NULL DEFAULT true,
+  allow_backdate  BOOLEAN NOT NULL DEFAULT false, -- true only for owner-role corrective amendments; logged
+  CHECK (effective_from >= created_at OR allow_backdate = true)  -- price-protection DB invariant
 );
 
 CREATE INDEX idx_rule_overrides_active ON rule_overrides(spec_id, rule_path) WHERE active = true;
@@ -1592,19 +1730,31 @@ When the solver encounters an `ai_evaluable` requirement with no fresh `ai.decis
 **Mechanism:**
 
 ```typescript
-// Inside solve():
+// Inside solve() — REVISED v1.4 (🔴 F3/Round 5: dayBucket replaced with context fingerprint).
+// v1.3 applied the context fingerprint to agentEvalIdempotencyKey's factory signature
+// but the call site still passed dayBucket (a string). TypeScript accepted it silently.
+// The idempotency key was still UTC-day scoped — the exact 24h staleness Fix 6 was meant to close.
 if (req.ai_evaluable && !hasFreshDecision(req, engagement)) {
-  const dayBucket = todayISO();  // UTC date for deduplication window
-  const key = agentEvalIdempotencyKey(engagement.id, req.key, dayBucket);
+  // Fingerprint changes whenever: a member is added/removed, a new event arrives,
+  // an exception is granted/revoked, or the spec version changes.
+  // A changed fingerprint = new key = new Inngest dispatch. Same fingerprint = deduped.
+  const fp = await computeEvalContextFingerprint(engagement.id);
+
+  // Also check dispatch_throttle (🔴 F6/Round 5: throttle table defined below).
+  // Prevents burst dispatches when multiple events arrive within a short window.
+  const throttled = await checkAndUpsertDispatchThrottle(engagement.id, req.key, fp);
+  if (throttled) return;  // fingerprint unchanged or within minimum interval — skip
+
+  const key = agentEvalIdempotencyKey(engagement.id, req.key, fp);
   await inngest.send({
-    id: key,  // Inngest-level deduplication; identical IDs collapse to single run
+    id: key,  // Inngest-level deduplication collapses identical (engagement, requirement, fingerprint) to one run
     name: 'agent/evaluate.requirement',
     data: { engagement_id: engagement.id, requirement_key: req.key },
   });
 }
 ```
 
-Inngest's event ID deduplication collapses identical events to a single workflow run within the event's lifetime. Multiple concurrent solver calls for the same `(engagement, requirement, day)` queue once — not N times.
+Inngest's event ID deduplication collapses identical events to a single workflow run. Multiple concurrent solver calls for the same `(engagement, requirement, fingerprint)` queue once. Context changes produce a new fingerprint and a new dispatch — without waiting for midnight UTC.
 
 **The solver is composable.** A client with Formation + Tax + RA Renewal engagements has the solver called independently per engagement. Each returns its own `StatusReport`. Compound rendering reads from `account_case` projection (§4.2.1) for per-account priority; the CRM Client 360 composes per-engagement solver outputs for drill-down. Cross-engagement dependencies are expressed DECLARATIVELY in specs via `dependsOnEngagement()` (see §6.4.1), and the solver resolves them through the event log.
 
@@ -1954,7 +2104,11 @@ const aiDecisionSchema = z.object({
     excerpt_token: z.string().regex(/^excerpt:/),  // token resolving to SOP text (not client PII)
   })).min(1),
 
-  recommendation_template_id: z.enum(['file_ss4','send_reminder','escalate_for_review','grant_exception','await_client_action', /* ... */]),
+  // REVISED v1.4 (🔴 F4/Round 5): z.string().uuid() replaces z.enum([...]).
+  // Round 4 Fix 6 changed reasoning_template_id and rationale_template_id but missed
+  // this sibling field. recommendation_template_id now validated against
+  // recommendation_templates DB table via the same 60s LRU cache pattern.
+  recommendation_template_id: z.string().uuid(),
   recommendation_slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
 });
 
@@ -2730,19 +2884,21 @@ export const exceptionExpirer = inngest.createFunction(
   { id: 'exception-expirer' },
   { cron: '30 0 * * *' },  // daily 00:30 UTC
   async ({ step }) => {
+    // 🟠 F11/Round 5: exceptions table has no account_id column; exc.account_id was
+    // undefined, causing the drain's account-channel broadcast to be skipped silently.
+    // Fix: JOIN engagements to get account_id at query time.
     const expiredExceptions = await step.run('find-expired', async () => {
-      const { data } = await supabaseAdmin
-        .from('exceptions')
-        .select('id, engagement_id')
-        .eq('status', 'active')
-        .lt('expires_at', new Date().toISOString());
+      const { data } = await supabaseAdmin.rpc('find_expired_exceptions');
+      // find_expired_exceptions():
+      //   SELECT e.id, e.engagement_id, eng.account_id
+      //   FROM exceptions e
+      //   JOIN engagements eng ON eng.id = e.engagement_id
+      //   WHERE e.status = 'active' AND e.expires_at < now()
       return data ?? [];
     });
 
     for (const exc of expiredExceptions) {
       await step.run(`expire-${exc.id}`, async () => {
-        // withEmit() (v1.3 parameterized) — entity update + event insert + outbox insert
-        // run in a single server-side Postgres transaction via emit_event_atomic().
         await withEmit({
           entityWrite: {
             table: 'exceptions',
@@ -2753,7 +2909,7 @@ export const exceptionExpirer = inngest.createFunction(
           actor_type: 'inngest',
           subject_type: 'exception',
           subject_id: exc.id,
-          account_id: exc.account_id,
+          account_id: exc.account_id,  // now defined — sourced from JOIN above
           payload: { exception_id: exc.id, engagement_id: exc.engagement_id },
           idempotency_key: `inngest:exception.expired:${exc.id}`,
         });
@@ -3316,41 +3472,39 @@ Anthropic's Batch API offers a flat 50% discount on all token costs for asynchro
 
 Interactive (synchronous) workloads — agent proposals, real-time chat responses, requirement evaluations during active user sessions — do not use Batch API. They run at full price because latency matters.
 
-### 15.4 Structured outputs
+### 15.4 Structured outputs — REVISED v1.4 (🔴 F5/Round 5: template-slot schema replaces free-form v1.0 schema)
 
-Every Claude invocation uses the Anthropic tool-use API with a strict JSON schema. This constrains the model to produce valid output that the application can deserialize without a parser.
+Every Claude invocation uses the Anthropic tool-use API with a strict JSON schema derived directly from the §8.5 Zod schema. **The Anthropic tool `input_schema` and the §8.5 Zod schema are the same definition, generated from a single source.** A CI assertion (`scripts/assert-tool-schema-sync.ts`) fails the build if they diverge.
 
-Example for requirement evaluation:
+**Why this matters (F5):** the v1.0 document showed `reasoning: { type: 'string', minLength: 20 }` and `recommendation: { type: 'string' }` as the Anthropic tool schema — free-form strings. Round 2 Fix B established the template-slot pattern (§8.5) precisely because models write client names into free-form reasoning fields (`"Marco Rossi has been waiting 10 days"`), which then survive as orphan PII in `ai.decision` payloads after GDPR deletion. The v1.0 schema in §15.4 contradicted Fix B; whichever section implementers follow first decides whether the PII protection holds. v1.4 eliminates the contradiction: there is one schema, derived from §8.5 Zod types.
+
+The Anthropic tool schema for requirement evaluation — generated from §8.5 Zod types:
 
 ```typescript
+// scripts/generate-tool-schemas.ts — run at build time; output committed as
+// lib/agents/tool-schemas.generated.ts and used in every Claude invocation.
+// CI: assert-tool-schema-sync.ts fails build if generated file is stale.
+
 const aiDecisionTool = {
   name: 'commit_requirement_decision',
-  input_schema: {
-    type: 'object',
-    properties: {
-      decision: { type: 'string', enum: ['eligible','not_eligible','requires_human_review'] },
-      confidence: { type: 'number', minimum: 0, maximum: 1 },
-      reasoning: { type: 'string', minLength: 20 },
-      evidence_cited: {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            source_type: { type: 'string', enum: ['sop_chunk','scar','event','document'] },
-            source_id: { type: 'string' },
-            excerpt: { type: 'string' }
-          },
-          required: ['source_type','source_id','excerpt']
-        },
-        minItems: 1
-      },
-      recommendation: { type: 'string' },
-      alternative_considered: { type: 'string', minLength: 20 },
-      weakness_acknowledged: { type: 'string', minLength: 20 }
-    },
-    required: ['decision','confidence','reasoning','evidence_cited','recommendation','alternative_considered','weakness_acknowledged']
-  }
+  input_schema: zodToJsonSchema(aiDecisionSchema),  // §8.5 Zod schema — single source of truth
 };
+
+// aiDecisionSchema (from §8.5) produces:
+// {
+//   decision: { enum: ['eligible','not_eligible','requires_human_review'] },
+//   confidence: { type: 'number', minimum: 0, maximum: 1 },
+//   reasoning_template_id: { type: 'string', format: 'uuid' },   // NOT a free-form string
+//   reasoning_slots: { type: 'object', additionalProperties: { oneOf: [uuid, number, token] } },
+//   evidence_cited: { type: 'array', items: { source_type, source_id, excerpt_token }, minItems: 1 },
+//   recommendation_template_id: { type: 'string', format: 'uuid' },  // NOT a free-form string
+//   recommendation_slots: { ... },
+//   alternative_considered_template_id: { type: 'string', format: 'uuid' },
+//   alternative_considered_slots: { ... },
+//   weakness_acknowledged_template_id: { type: 'string', format: 'uuid' },
+//   weakness_acknowledged_slots: { ... },
+// }
+// No free-form string field exists in this schema. The model cannot write PII into reasoning.
 ```
 
 If the model tries to emit output that doesn't match the schema, Anthropic's API rejects the output and the call retries (with guidance). If it consistently fails, the agent escalates to human review.
