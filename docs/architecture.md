@@ -1,8 +1,8 @@
 # Smart AI TD Operations — Architecture Plan
 
-**Version:** 1.2 — Post-Round 3 adversarial review (final)
-**Date:** 2026-04-22 (v1.2 revision); v1.1 same date; 2026-04-21 (v1.0)
-**Status:** Pre-build. Three rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
+**Version:** 1.3 — Post-Round 4 adversarial review (final)
+**Date:** 2026-04-22 (v1.3 revision); v1.2 same date; v1.1 same date; 2026-04-21 (v1.0)
+**Status:** Pre-build. Four rounds of adversarial review complete. All identified flaws resolved. D1-D9 locked with named kill criteria. Ready for Stage 0.
 
 ## v1.2 Changelog — What Changed Since v1.0
 
@@ -49,13 +49,30 @@
 |---|---|---|
 | 🔴 1. Fix E tautological — evidence_event_hash predicate `lte` returns same set always | Guard fires never; stale-evidence approvals happen at full rate | **Invert: query events with `created_at > proposal.generated_at`; include cross-engagement events matching solver invalidation graph** |
 | 🔴 2. account_members UNIQUE constraint broken under Postgres NULL semantics | Two simultaneous active memberships allowed; solver double-counts per_member requirements | **Replace with partial unique index: `CREATE UNIQUE INDEX ON account_members(account_id, contact_id) WHERE left_at IS NULL`** |
-| 🔴 3. emit() two atomicity contracts; unsafe default | Callers use RPC emit() outside a transaction by default; split-brain on any emit() failure | **Single export `withEmit(tx, callback)`; internal RPC becomes private; no public bare emit()** |
+| 🔴 3. emit() two atomicity contracts; unsafe default | Callers use RPC emit() outside a transaction by default; split-brain on any emit() failure | **Single export `withEmit(input)`; all logic moves into `emit_event_atomic()` Postgres function (v1.3 — see Round 4 Fix 1 for implementation correction); no public bare emit()** |
 | 🔴 4. GDPR deletion contradicts FK schema — deleting sensitive_data rows throws FK violation | GDPR compliance blocked by database constraint on first attempt | **Soft-delete: set `encrypted_value = NULL` + `deleted_at`; resolver returns null; FK preserved** |
 | 🔴 5. Outbox drain publishes to global `'events'` channel; portal subscribes to engagement-scoped channels | Portal receives nothing from drain; Realtime latency SLO permanently unmet | **Drain computes channel from `engagement_id`/`account_id`; publishes there; admin broadcast is separate** |
 | 🔴 6. Agent dispatch idempotency key uses UTC day bucket with no context fingerprint | Context changes mid-day (new member, exception, payment) produce same key → Inngest dedupes → 24h staleness | **Key includes `hash(active_member_ids, max_event_id, active_exception_ids, spec_version)`; dispatch-throttle table for cost control** |
 | 🟠 7. Exception expiry cron uses two transactions (UPDATE then emit()) | Split-brain: state updates without event or event without state depending on failure order | **All crons use `withEmit(tx, callback)`; §16.4 crons audited against this rule** |
 | 🟠 8. "Different infrastructure" monitor is a Supabase Edge Function — same infra as what it monitors | Regional Supabase incident blinds the monitor simultaneously | **Move monitor to Cloudflare Worker cron or Better Stack — genuinely external to Supabase, Vercel, and Inngest** |
 | 🟠 9. Calibration conflates admin approval with correctness | Batch-approve UX creates rubber-stamp feedback loop; thresholds drift down as quality degrades | **Separate `admin_approved` (immediate) from `outcome_correct` (materialized later); calibration runs on `outcome_correct` only** |
+
+### Round 4 (fourth reviewer, architecture-only): 3 load-bearing flaws + 4 significant + 1 minor
+
+| Flaw | Consequence | Fix |
+|---|---|---|
+| 🔴 1. `withEmit()` passes a JS callback to `supabase.rpc()` — technically impossible; `rpc()` sends an HTTP POST with JSON-serialized args; callbacks are not JSON-serializable; PgBouncer transaction mode breaks multi-statement BEGIN/COMMIT from serverless | Every atomicity guarantee introduced by Fix 3 fails to build; all nine previously closed split-brain findings re-open | **Replace JS callback with a parameterized `emit_event_atomic()` Postgres function (plpgsql) that handles entity write + events insert + outbox insert in one server-side transaction; `withEmit()` becomes a typed JS wrapper that calls it via single `rpc()` invocation** |
+| 🔴 2. `canOverridePath()` does exact-match on glob-pattern strings; `'pricing_rules.base_price_usd'` never matches `'pricing_rules.*'`; every override permanently denied | CRM spec editor's Values tab broken on first use; "rules as data" promise fails at authorization layer | **Query uses `WHERE $rulePath LIKE path_prefix || '%'`; path prefixes stored without trailing `*` (e.g., `'pricing_rules.'`); data migration for existing rows** |
+| 🔴 3. `step.waitForEvent(match: 'data.engagement_id')` references a field absent from both `engagement.started` and `requirement.satisfied` payloads; match either never resolves (7-day timeout) or resolves for wrong engagement | Formation pipeline core wait step silently fails on every real formation | **Drain injects `engagement_id: row.subject_id` into every Inngest event's `data` envelope when `subject_type === 'engagement'`; `data.engagement_id` becomes canonical correlation key across all `step.waitForEvent` calls** |
+| 🟠 4. Solver evaluates `account.company_name` when `engagement.account_id IS NULL`; no account to dereference; undefined behavior (null-ref, always-missing, or wrong fallback) | Pre-formation engagement data model undefined for first 30-70% of formation lifecycle | **Add `when_account_null` fallback field to `ReqData` DSL; wizard writes pre-account data to `engagement.metadata`; solver reads metadata fallback when `account_id IS NULL`** |
+| 🟠 5. Full PII tokenization (no raw names/emails in `contacts`) makes fuzzy CRM search (substring, prefix, domain) architecturally impossible with SHA-256 hash lookup | CRM admin search-by-name operationally broken; partial-match search requires decrypting all records in memory | **Accept as Stage 1 known constraint (225 clients, account search by plaintext company_name covers 95% of CRM lookups); document contact name search as exact-hash-only; blind-index approach (CipherSweet n-gram) deferred to Stage 2** |
+| 🟠 6. `reasoning_template_id: z.enum([...generated...])` is built at compile time; adding a DB template at runtime leaves it outside the enum; agent cannot select it without a redeploy | Template catalog claims "no code change to add a template" but requires schema regeneration + deploy for every addition | **Change to `z.string().uuid()`; validate template ID against DB at agent invocation time (60s cache); CI check becomes "all pinned template references still exist in DB," not "DB state is in the enum"** |
+| 🟠 7. `client_routing.contact_id REFERENCES contacts(id)` — FK across two Supabase projects is impossible; v1 and v2 are separate Postgres instances | Any single-database table placement leaves the other system without FK integrity or requires expensive cross-project HTTP on every offer | **Drop FK; use email hash as routing key (no referential integrity across projects — expected); table lives in v2; v1 reads via lightweight HTTP call to v2 routing endpoint** |
+| 🟡 8. Batch API savings math double-counted; document subtracts full 10%-of-total as discount instead of 50%-of-10%-of-total | Cost estimate at 225 clients understated by ~$39/month; error compounds at scale | **Fix: savings = 10% × $785 × 50% = $39; correct total = $785 − $39 = **$746/month**; all downstream scale references updated** |
+
+### What v1.3 adds by way of scar protection
+
+Every flaw identified in Round 4 becomes a scar in `v1_scars`: `supabase.rpc()` callback impossibility, authorization prefix-match vs. exact-match distinction, Inngest `data` envelope canonical fields, solver null-entity evaluation rules, PII tokenization search constraints, schema code-gen vs. runtime validation boundary, cross-database FK impossibility, and cost model double-counting. Future designs check against these before shipping.
 
 ### What v1.2 does NOT change
 
@@ -652,8 +669,18 @@ export const outboxDrain = inngest.createFunction(
     for (const row of batch) {
       await step.run(`publish-${row.id}`, async () => {
         try {
-          // Publish to Inngest event stream for downstream workflows
-          await inngest.send({ id: row.event_id, name: row.event_type, data: row.payload });
+          // Publish to Inngest event stream for downstream workflows.
+          // 🔴 Fix 3/Round 4: inject engagement_id into every engagement-scoped event's
+          // data envelope. Inngest step.waitForEvent(match: 'data.engagement_id') requires
+          // this field to exist on both the triggering event AND the waited-for event.
+          // Without injection, match never resolves (or resolves for wrong engagements).
+          // engagement_id = row.subject_id when subject_type === 'engagement'.
+          const inngestData = {
+            ...row.payload,
+            ...(row.subject_type === 'engagement' && { engagement_id: row.subject_id }),
+            account_id: row.account_id,   // also inject for account-level correlation
+          };
+          await inngest.send({ id: row.event_id, name: row.event_type, data: inngestData });
 
           // 🔴 Fix 5 — Publish to engagement-scoped Realtime channels, not a global 'events' channel.
           // Portal pages subscribe per-engagement (e.g. channel `engagement:{id}`).
@@ -778,65 +805,140 @@ Events are organized by domain. The catalog below is the first-cutover set (Stag
 
 This catalog grows as the system grows. Adding a new event type is adding a TypeScript type definition to `lib/events/types.ts`, a Zod schema validator, and a row to a registry — not a code refactor across many files.
 
-### 5.4 emit() contract — REVISED v1.2 (🔴 Fix 3: single `withEmit()` export; no public bare emit())
+### 5.4 emit() contract — REVISED v1.3 (🔴 Fix 1/Round 4: Postgres function replaces unimplementable JS callback; 🔴 Fix 3/Round 3: single `withEmit()` export)
 
-`withEmit()` is the single exported entry point for writing to the event log. No other code writes directly to `events` or `outbox`. No code calls an internal emit directly. The internal `_emitRpc()` is not a public API.
+`withEmit()` is the single exported entry point for writing to the event log. No other code writes directly to `events` or `outbox`.
 
-**Why single export matters:** v1.1 exported both `emit()` (RPC-based, its own transaction) and `emitInTransaction(tx, ...)` (caller's transaction). This made the unsafe variant the ergonomic default: `await dbUpdate(X); await emit(Y)` compiles and passes review, but the two calls run in separate transactions. If `emit()` fails, the state write already committed — permanent split-brain. Under production load, some fraction of emit() calls will fail intermittently; every one produces silent state-vs-event divergence where the solver caches stale state forever. v1.2 closes this footgun by making the unsafe form physically unrepresentable.
+**Why the v1.2 callback design was unimplementable.** v1.2 wrote `supabaseAdmin.rpc('run_in_transaction', async () => { ... })` — a JavaScript async callback passed to an RPC call. This is architecturally impossible: `supabase.rpc()` sends an HTTP POST with JSON-serialized arguments to a Postgres stored procedure. An async JS callback is not JSON-serializable. Postgres cannot receive or execute JavaScript. Additionally, Supabase's default connection pooler (PgBouncer in transaction mode) does not support multi-statement interactive transactions from serverless: each statement may be dispatched to a different connection from the pool, so a client-side `BEGIN` / entity write / `INSERT INTO events` / `INSERT INTO outbox` / `COMMIT` sequence is not guaranteed to be atomic.
+
+**v1.3 fix: server-side Postgres function.** All entity write + event insert + outbox insert logic moves into a `plpgsql` function `emit_event_atomic()`. Postgres wraps the entire `plpgsql` function body in a transaction automatically — no client-side `BEGIN`/`COMMIT` is needed. The JS `withEmit()` wrapper validates the input with Zod and calls `rpc('emit_event_atomic', params)` as a single HTTP roundtrip. Everything is atomic inside the Postgres function.
+
+```sql
+-- Postgres function (runs entirely server-side in one implicit transaction)
+CREATE OR REPLACE FUNCTION emit_event_atomic(
+  p_entity_table  TEXT,           -- e.g., 'engagements'
+  p_entity_pk     UUID,           -- the row to update
+  p_entity_update JSONB,          -- { "status": "active", "started_at": "..." }
+  p_event_type    TEXT,           -- e.g., 'engagement.started'
+  p_actor_type    TEXT,           -- 'inngest' | 'cron' | 'webhook' | 'agent' | 'admin' | 'migration'
+  p_subject_type  TEXT,           -- 'engagement' | 'account' | 'contact' | etc.
+  p_subject_id    UUID,
+  p_account_id    UUID,
+  p_payload       JSONB,
+  p_idempotency_key TEXT DEFAULT NULL
+) RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER AS $$
+DECLARE
+  v_event_id UUID := gen_random_uuid();
+BEGIN
+  -- 1. Apply entity update (supported tables only — no dynamic SQL for security)
+  IF p_entity_table = 'engagements' THEN
+    UPDATE engagements
+    SET status      = COALESCE((p_entity_update->>'status'), status),
+        started_at  = COALESCE((p_entity_update->>'started_at')::TIMESTAMPTZ, started_at),
+        completed_at = COALESCE((p_entity_update->>'completed_at')::TIMESTAMPTZ, completed_at)
+        -- additional columns added as the schema grows
+    WHERE id = p_entity_pk;
+  ELSIF p_entity_table = 'exceptions' THEN
+    UPDATE exceptions
+    SET status     = COALESCE((p_entity_update->>'status'), status),
+        expired_at = COALESCE((p_entity_update->>'expired_at')::TIMESTAMPTZ, expired_at)
+    WHERE id = p_entity_pk;
+  -- ELSIF p_entity_table = 'service_deliveries' THEN ...
+  -- Additional tables registered here as Stage 0+ schemas are built.
+  END IF;
+
+  -- 2. Idempotency check: if this key already exists, return the existing event_id
+  IF p_idempotency_key IS NOT NULL THEN
+    SELECT id INTO v_event_id FROM events WHERE idempotency_key = p_idempotency_key;
+    IF FOUND THEN
+      RETURN v_event_id;
+    END IF;
+    v_event_id := gen_random_uuid();  -- fresh for new event
+  END IF;
+
+  -- 3. Insert event
+  INSERT INTO events (id, event_type, actor_type, subject_type, subject_id, account_id, payload, idempotency_key)
+  VALUES (v_event_id, p_event_type, p_actor_type, p_subject_type, p_subject_id, p_account_id, p_payload, p_idempotency_key);
+
+  -- 4. Insert outbox (triggers drain)
+  INSERT INTO outbox (event_id, status) VALUES (v_event_id, 'pending');
+
+  RETURN v_event_id;
+END;
+$$;
+```
+
+The JS wrapper validates before calling:
 
 ```typescript
 // lib/events/emit.ts — ONLY public export is withEmit()
 
-/**
- * The ONLY way to emit an event. Caller passes entity writes as a callback
- * alongside the emit call, so both happen in a single Postgres transaction.
- *
- * Usage:
- *   await withEmit(async (emit) => {
- *     await tx.from('engagements').update({ status: 'active' }).eq('id', id);
- *     await emit({ event_type: 'engagement.started', ... });
- *   });
- *
- * The tx handle is opened inside withEmit — no caller receives a raw tx.
- * Both the entity write and the outbox insert commit together or roll back together.
- */
-export async function withEmit(
-  callback: (emit: EmitFn) => Promise<void>,
-): Promise<{ event_id: string }[]> {
-  const emittedIds: { event_id: string }[] = [];
+export type EntityWrite = {
+  table: SupportedEntityTable;   // 'engagements' | 'exceptions' | 'service_deliveries' | ...
+  pk: string;
+  update: Record<string, unknown>;
+};
 
-  await supabaseAdmin.rpc('run_in_transaction', async () => {
-    const emit: EmitFn = async (input) => {
-      if (requiresIdempotencyKey(input.actor_type) && !input.idempotency_key) {
-        throw new EmitError(`idempotency_key required for actor_type=${input.actor_type}`);
-      }
-      const schema = eventSchemas[input.event_type];
-      const validated = schema.parse(input.payload);  // Zod validation before write
-      const result = await _emitRpc(validated);        // internal, not exported
-      emittedIds.push(result);
-    };
-    await callback(emit);
+export type EmitInput = {
+  entityWrite?: EntityWrite;     // optional — some events have no accompanying state write
+  event_type: string;
+  actor_type: ActorType;
+  subject_type: string;
+  subject_id: string;
+  account_id?: string;
+  payload: unknown;
+  idempotency_key?: string;      // REQUIRED when actor_type in ('webhook','cron','agent','migration')
+};
+
+/**
+ * The ONLY way to emit an event in Smart AI.
+ * Validates with Zod, then calls emit_event_atomic() as a single Postgres RPC.
+ * Entity write + events insert + outbox insert run in one server-side transaction.
+ *
+ * For operations touching more than one entity, decompose into multiple
+ * Inngest steps — each step calls withEmit() for its own atomic unit.
+ */
+export async function withEmit(input: EmitInput): Promise<string> {
+  if (requiresIdempotencyKey(input.actor_type) && !input.idempotency_key) {
+    throw new EmitError(`idempotency_key required for actor_type=${input.actor_type}`);
+  }
+
+  const schema = eventSchemas[input.event_type];
+  const validatedPayload = schema.parse(input.payload);  // Zod before any DB write
+
+  const { data: eventId, error } = await supabaseAdmin.rpc('emit_event_atomic', {
+    p_entity_table:   input.entityWrite?.table ?? null,
+    p_entity_pk:      input.entityWrite?.pk ?? null,
+    p_entity_update:  input.entityWrite?.update ?? null,
+    p_event_type:     input.event_type,
+    p_actor_type:     input.actor_type,
+    p_subject_type:   input.subject_type,
+    p_subject_id:     input.subject_id,
+    p_account_id:     input.account_id ?? null,
+    p_payload:        validatedPayload,
+    p_idempotency_key: input.idempotency_key ?? null,
   });
 
-  return emittedIds;
+  if (error) throw new EmitError(`emit_event_atomic failed: ${error.message}`);
+  return eventId;
 }
 
-// Internal implementation — NOT exported. This cannot be called from outside emit.ts.
-async function _emitRpc(validated: ValidatedEventInput): Promise<{ event_id: string }> {
-  return await supabaseAdmin.rpc('emit_event', { /* ... */ });
-}
-
-// ESLint rule in .eslintrc.json:
-// "no-restricted-imports": [{ "name": "@/lib/events/emit", "importNames": ["_emitRpc"] }]
-// No one can import the internal function even if they try.
+// ESLint rule prevents direct .from('events') and .from('outbox') writes outside this file.
+// CI grep enforces the same. No escape hatch exists by construction.
 ```
 
-**Enforced by three layers:**
-1. **Single public API:** `withEmit()` is the only export from `lib/events/emit.ts`. `_emitRpc` is a module-private function.
-2. **ESLint rule:** `no-restricted-syntax` targeting `.from('events')` and `.from('outbox')` outside `lib/events/emit.ts`.
-3. **CI grep:** regex scan for `_emitRpc`, `.from('events')`, `.from('outbox')` outside their permitted files. Build fails on match.
+**Constraint: one entity write per atomic unit.** Because `emit_event_atomic` handles one entity (one row, one table), each `withEmit()` call is scoped to one state change + one event. Operations spanning multiple entities decompose into chained Inngest steps — each step calls `withEmit()` for its own atomic unit. This is the Round 1 hot-path design. Inngest checkpoints between steps; no single transaction holds locks across multiple entity writes.
 
-**The transaction ceiling rule applies inside `withEmit` callbacks:**
+**Why the constraint is acceptable:** almost every real state change is one entity + one event. "Payment confirmed → activate engagement" is one write (engagements row) + one event (engagement.started). "Payment confirmed → generate invoice → activate services → queue welcome" is four steps, each one write + one event — and Inngest guarantees each step runs exactly once. The chaining is the feature; the decomposition is the safety property.
+
+**Enforced by three layers:**
+1. **Single public API:** `withEmit()` is the only export from `lib/events/emit.ts`.
+2. **ESLint rule:** `no-restricted-syntax` targeting `.from('events')` and `.from('outbox')` outside `lib/events/emit.ts`.
+3. **CI grep:** regex scan for `.from('events')`, `.from('outbox')` outside their permitted files. Build fails on match.
+
+**The transaction ceiling rule applies inside each `withEmit` call:**
 
 #### Transaction size ceiling (v1.1 HARD limit)
 
@@ -849,42 +951,45 @@ The calling transaction that wraps `emit()` MUST stay under:
 **Example: payment confirmation (state changes span accounts + engagements + service_deliveries + members + notifications):**
 
 ```typescript
-// lib/inngest/functions/payment-confirmed.ts — v1.2 using withEmit()
+// lib/inngest/functions/payment-confirmed.ts — v1.3 using withEmit() (parameterized, not callback)
 export const paymentConfirmedFlow = inngest.createFunction(
   { id: 'payment-confirmed-flow' },
   { event: 'payment.confirmed' },  // triggered by outbox drain
   async ({ event, step }) => {
-    // Step 1: update engagement status (1 write + 1 emit, atomic inside withEmit)
+    // Step 1: update engagement status (1 entity write + 1 event, atomic server-side)
     await step.run('activate-engagement', async () => {
-      await withEmit(async (emit) => {
-        await supabaseAdmin.from('engagements')
-          .update({ status: 'active', started_at: new Date() })
-          .eq('id', event.data.engagement_id);
-        await emit({ event_type: 'engagement.started', actor_type: 'inngest',
-          idempotency_key: webhookIdempotencyKey('inngest', `activate:${event.data.engagement_id}`), ... });
+      await withEmit({
+        entityWrite: {
+          table: 'engagements',
+          pk: event.data.engagement_id,
+          update: { status: 'active', started_at: new Date().toISOString() },
+        },
+        event_type: 'engagement.started',
+        actor_type: 'inngest',
+        subject_type: 'engagement',
+        subject_id: event.data.engagement_id,
+        account_id: event.data.account_id,
+        payload: { trigger: 'payment_confirmed' },
+        idempotency_key: `inngest:activate:${event.data.engagement_id}`,
       });
     });
 
-    // Step 2: generate invoice (1 write + 1 emit, atomic)
+    // Step 2: generate invoice (invoice insert + event, atomic)
     await step.run('generate-invoice', async () => {
-      await withEmit(async (emit) => {
-        // ... invoice insert + payment.invoice_generated emit
+      await withEmit({
+        entityWrite: { table: 'payments', pk: newInvoiceId, update: { /* invoice fields */ } },
+        event_type: 'payment.invoice_generated',
+        actor_type: 'inngest',
+        subject_type: 'engagement',
+        subject_id: event.data.engagement_id,
+        account_id: event.data.account_id,
+        payload: { invoice_id: newInvoiceId },
+        idempotency_key: `inngest:invoice:${event.data.engagement_id}`,
       });
     });
 
-    // Step 3: activate services (N service_deliveries; each is its own step iteration)
-    await step.run('activate-services', async () => {
-      await withEmit(async (emit) => {
-        // ... service_delivery updates + service.activated emit
-      });
-    });
-
-    // Step 4: enqueue welcome communication (1 write + 1 emit, atomic)
-    await step.run('queue-welcome', async () => {
-      await withEmit(async (emit) => {
-        // ... communication_queue insert + communication.queued emit
-      });
-    });
+    // Step 3: activate services, queue welcome (each is its own step)
+    // Each step = one entity write + one event, atomic.
   }
 );
 ```
@@ -1030,13 +1135,27 @@ export const smllcFormation = defineSpec({
       condition: { event_type: 'payment.confirmed', subject: '$engagement' },
       blocks: ['*'],  // no other requirement progresses until payment confirmed
     }),
+    // REVISED v1.3 (🟠 Fix 4/Round 4): account_id is nullable pre-formation.
+    // When account_id IS NULL, the solver falls back to engagement.metadata fields
+    // collected by the wizard before account creation. The `when_account_null`
+    // DSL field tells the solver which metadata key to read instead.
+    // The wizard writes pre-account data to engagement.metadata at collection time.
     ReqData({
       key: 'company_name',
-      condition: { field: 'account.company_name', not_null: true },
+      condition: {
+        field: 'account.company_name',
+        not_null: true,
+        when_account_null: 'engagement.metadata.company_name',  // fallback pre-account
+      },
     }),
     ReqData({
       key: 'state',
-      condition: { field: 'account.state_of_formation', not_null: true, in: ['New Mexico','Wyoming','Delaware','Florida','Nevada'] },
+      condition: {
+        field: 'account.state_of_formation',
+        not_null: true,
+        in: ['New Mexico','Wyoming','Delaware','Florida','Nevada'],
+        when_account_null: 'engagement.metadata.state_of_formation',  // fallback pre-account
+      },
     }),
     ReqDocument({
       key: 'member_passport',
@@ -1198,33 +1317,57 @@ Role semantics (first cutover):
 - **`reviewer`** — future read-only auditor role.
 - **`read_only`** — service account or external integrations.
 
-Role-checking at override time:
+Role-checking at override time — REVISED v1.3 (🔴 Fix 2/Round 4: prefix match, not exact match):
+
 ```typescript
 // lib/specs/permissions.ts
 export async function canOverridePath(
   userId: string,
   rulePath: string,
 ): Promise<boolean> {
-  const policy = await db.rule_path_policy.findFirst({ where: { path_prefix: rulePath } });
-  if (!policy) return false;  // no policy = not overridable
+  // v1.2 BUG: findFirst({ where: { path_prefix: rulePath } }) does exact-match.
+  // 'pricing_rules.base_price_usd' never matches stored prefix 'pricing_rules.'
+  // — every override was permanently denied.
+  //
+  // v1.3 FIX: use a raw SQL LIKE query so any rule path starting with a stored
+  // prefix matches. 'pricing_rules.base_price_usd' LIKE 'pricing_rules.' || '%' → true.
+  const { data: policies } = await supabaseAdmin
+    .rpc('find_path_policy', { p_rule_path: rulePath });
+    // find_path_policy: SELECT * FROM rule_path_policy WHERE $1 LIKE path_prefix || '%'
+    //                   ORDER BY length(path_prefix) DESC LIMIT 1  (most specific wins)
+
+  if (!policies || policies.length === 0) return false;  // no matching prefix = not overridable
+  const policy = policies[0];
   const userRoles = await getActiveRoles(userId);
-  return policy.allowed_roles.some(r => userRoles.includes(r));
+  return policy.allowed_roles.some((r: string) => userRoles.includes(r));
 }
 ```
 
-The `rule_path_policy` table maps path prefixes to allowed roles:
 ```sql
+CREATE OR REPLACE FUNCTION find_path_policy(p_rule_path TEXT)
+RETURNS SETOF rule_path_policy
+LANGUAGE sql STABLE AS $$
+  SELECT * FROM rule_path_policy
+  WHERE p_rule_path LIKE path_prefix || '%'
+  ORDER BY length(path_prefix) DESC   -- most specific prefix wins on overlap
+  LIMIT 1;
+$$;
+
 CREATE TABLE rule_path_policy (
-  path_prefix   TEXT NOT NULL,    -- e.g., 'pricing_rules.*', 'follow_up_rules.*'
+  path_prefix   TEXT NOT NULL,    -- stored WITHOUT trailing '*', e.g., 'pricing_rules.'
   allowed_roles TEXT[] NOT NULL,  -- e.g., ['owner'], ['owner','admin']
   PRIMARY KEY (path_prefix)
 );
 
--- Seed data:
--- 'pricing_rules.*'   → ['owner']
--- 'follow_up_rules.*' → ['owner', 'admin']
--- 'exceptions_config.*' → ['owner', 'admin']
+-- Seed data (note: no '*' suffix — prefix match handles the wildcard):
+-- 'pricing_rules.'      → ['owner']
+-- 'follow_up_rules.'    → ['owner', 'admin']
+-- 'exceptions_config.'  → ['owner', 'admin']
 ```
+
+**Data migration from v1.2:** strip trailing `.*` from all existing `path_prefix` rows and append `.` instead. One-line SQL: `UPDATE rule_path_policy SET path_prefix = regexp_replace(path_prefix, '\.\*$', '.')`.
+
+**Most-specific-wins ordering:** if both `'pricing_rules.'` and `'pricing_rules.base_price_usd'` exist as prefixes (for finer-grained control), the longer (more specific) match wins via `ORDER BY length(path_prefix) DESC`.
 
 ---
 
@@ -1552,6 +1695,12 @@ For each requirement in the spec, the solver runs:
 
 **If `type: data`:** evaluate the field condition against the entity state (`account`, `contact`, `engagement`). Field not null / equals / in list / etc. If met, `status: satisfied`.
 
+**Null-account handling — REVISED v1.3 (🟠 Fix 4/Round 4).** When `engagement.account_id IS NULL` (pre-formation — the account does not exist yet), any `account.*` field reference would null-dereference. The solver MUST NOT crash or silently treat all account requirements as `missing` without attempting the fallback. Resolution:
+- If the requirement's condition specifies `when_account_null: 'engagement.metadata.X'`, the solver reads `engagement.metadata.X` instead of `account.X` when `account_id IS NULL`.
+- If `when_account_null` is not specified and `account_id IS NULL`, the requirement status is `pending_account` — a new status meaning "this requirement cannot be evaluated until the account exists; it does not block downstream requirements that don't depend on it."
+- The wizard writes all pre-account data (company name, state, member list) to `engagement.metadata` at collection time. These values migrate to the account record when `account.formation_confirmed` fires.
+- The `pending_account` status is distinct from `missing` — the CRM renders it as "Account not yet created; requirement will auto-evaluate on formation confirmation" rather than "Action required."
+
 **If `type: document`:** check for a `document.uploaded` event (and absence of `document.expired`) matching the spec's condition. For `per_member` requirements, iterate over `account_members where left_at IS NULL` and report status per-member.
 
 **If `type: deliverable`:** check for the specified event type (e.g., `account.ein_received`). If the event exists and is recent enough (per spec), `status: satisfied`.
@@ -1786,10 +1935,16 @@ const aiDecisionSchema = z.object({
   decision: z.enum(['eligible','not_eligible','requires_human_review']),
   confidence: z.number().min(0).max(1),
 
-  // Reasoning template — the agent selects from a finite set of templates authored in `lib/agents/reasoning-templates.ts`
+  // Reasoning template — the agent selects from a finite set of templates in the `reasoning_templates` DB table.
   // Templates are authored with slot placeholders: {{days_pending}}, {{requirement_key}}, {{contact_token}}
-  // Slots are filled with values the schema validates as non-PII (tokens or typed non-identifying fields)
-  reasoning_template_id: z.enum(['cutoff_date_passed','documents_complete','depends_on_blocker','policy_exception_applies','ambiguous_edge_case','precedent_from_similar', /* ... */]),
+  // Slots are filled with values the schema validates as non-PII (tokens or typed non-identifying fields).
+  //
+  // REVISED v1.3 (🟠 Fix 6/Round 4): z.string().uuid() replaces z.enum([...generated...]).
+  // Reason: z.enum values are fixed at build time from the code-gen script. Adding a new template
+  // to the DB at runtime would leave it outside the enum — the agent cannot select it without a redeploy.
+  // The fix: validate the template ID against the DB at invocation time (60s LRU cache).
+  // A template added via CRM is immediately available to the agent. No code change, no redeploy.
+  reasoning_template_id: z.string().uuid(),  // validated against reasoning_templates at invocation time
   reasoning_slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
 
   // Evidence must reference structured records, not contain narrative text
@@ -1816,7 +1971,7 @@ const proposalSchema = z.object({
   }),
 
   // Rationale is a template + slots, same as decision reasoning
-  rationale_template_id: z.enum([/* enumerated catalog */]),
+  rationale_template_id: z.string().uuid(),  // validated against proposal_templates at invocation time
   rationale_slots: z.record(z.union([z.string().uuid(), z.number(), z.string().regex(/^token:/)])),
 
   confidence: z.number().min(0).max(1),
@@ -1845,20 +2000,22 @@ const proposalSchema = z.object({
 
 #### Enforcement
 
-- Zod schema validation on every agent response. Mismatch = retry with guidance (up to 2); then escalate.
-- CI check: all `template_id` values in agent outputs must exist in `reasoning_templates` and `proposal_templates` at deploy time. Orphan references fail the build.
-- Pre-emit scrubber (§14.1 REVISED) is a belt-and-suspenders secondary control on any free-form field that still exists in the system (e.g., exception reasons typed by humans).
+- **Zod schema validation** on every agent response (structure, slot types, non-PII). Mismatch = retry with guidance (up to 2 retries); then escalate.
+- **Runtime template ID validation**: on every agent invocation, the dispatch layer checks that the `reasoning_template_id` and `recommendation_template_id` values the model returned exist in the DB (60s LRU cache of valid IDs). Unknown ID = retry with error injection ("template_id X does not exist; choose from the current catalog"); then escalate.
+- **CI check (v1.3 revised):** CI no longer checks that DB template state is encoded in `z.enum`. Instead, it checks: (a) all template IDs referenced in pinned configs (e.g., default templates in `agent_dispatch` table) still exist in the DB seed file; (b) the seed file compiles without missing references. This catches "someone deleted a template that's still configured as a default" without blocking template additions. Orphan default references fail build; new templates don't.
+- **Pre-emit scrubber** (§14.1 REVISED) is a belt-and-suspenders secondary control on any free-form field that still exists in the system (e.g., exception reasons typed by humans).
 
-### 8.5.1 Agent schema code-gen (v1.1 fix for 🟡 Flaw L)
+### 8.5.1 Agent schema code-gen — REVISED v1.3 (🟠 Fix 6: runtime template validation replaces build-time enum)
 
-The Zod schemas above are NOT hand-written. They are generated at build time from the spec engine and template catalog:
+The structural Zod schemas (slot types, action_type enum, evidence_cited shape) are generated at build time from the spec engine. The template ID fields are NOT generated enums — they are `z.string().uuid()` validated at runtime.
 
 - `lib/specs/*.ts` — specs declare what their requirements' evaluation contracts look like.
-- `lib/agents/reasoning-templates.ts` — reasoning template catalog (committed; sourced from `reasoning_templates` table via seed).
-- `scripts/generate-agent-schemas.ts` — reads specs + templates at build time, emits `lib/agents/schemas.generated.ts`.
-- CI fails if `schemas.generated.ts` is out of sync with source.
+- `lib/agents/reasoning-templates.ts` — seed file for initial ~50 templates (committed to git; mirrors DB `reasoning_templates` table at deploy time).
+- `scripts/generate-agent-schemas.ts` — reads specs at build time, emits structural Zod schemas for action types, slot shapes, evidence types. Does NOT emit template ID enums.
+- `lib/agents/template-cache.ts` — 60s LRU cache of valid template IDs, hydrated from `reasoning_templates` + `proposal_templates` at invocation time. Adding a DB row immediately makes the template available without a redeploy.
+- CI fails if the structural schema (action_type, slot types, evidence_cited) is out of sync with spec source. CI does NOT fail when new templates are added to the DB.
 
-Schema drift between specs and agent outputs becomes impossible by construction.
+**What this enables:** Antonio adds a new reasoning template via the CRM UI (new row in `reasoning_templates`) → template is immediately selectable by the agent on the next invocation after the 60s cache TTL. No code change. No deploy. No PR. The original claim ("adding a template = no code change") is now true.
 
 ### 8.6 Multi-model tiering
 
@@ -2567,13 +2724,13 @@ CREATE INDEX idx_exceptions_requirement_pattern ON exceptions(requirement_key, c
 The cron must update the row status AND emit `exception.expired` atomically. If the two operations are in separate transactions, a crash between them produces either: (a) the row marked expired but no event → solver does not re-evaluate → expired exception still treated as active → silent mis-state; or (b) the event emitted but the row not updated → event consumers see an expiry that the DB doesn't reflect → inconsistency.
 
 ```typescript
-// All §16.4 crons use withEmit() — same atomicity contract as any other state change.
+// All §16.4 crons use withEmit() (parameterized, v1.3) — same atomicity contract as any state change.
 // lib/workflows/exception-expirer.ts
 export const exceptionExpirer = inngest.createFunction(
   { id: 'exception-expirer' },
   { cron: '30 0 * * *' },  // daily 00:30 UTC
   async ({ step }) => {
-    const expiredIds = await step.run('find-expired', async () => {
+    const expiredExceptions = await step.run('find-expired', async () => {
       const { data } = await supabaseAdmin
         .from('exceptions')
         .select('id, engagement_id')
@@ -2582,22 +2739,23 @@ export const exceptionExpirer = inngest.createFunction(
       return data ?? [];
     });
 
-    for (const exc of expiredIds) {
+    for (const exc of expiredExceptions) {
       await step.run(`expire-${exc.id}`, async () => {
-        await withEmit(async (emit) => {
-          // State update and event emission in one atomic transaction:
-          await supabaseAdmin
-            .from('exceptions')
-            .update({ status: 'expired', expired_at: new Date() })
-            .eq('id', exc.id);
-          await emit({
-            event_type: 'exception.expired',
-            actor_type: 'inngest',
-            subject_type: 'exception',
-            subject_id: exc.id,
-            idempotency_key: `exception.expired:${exc.id}`,
-            payload: { exception_id: exc.id, engagement_id: exc.engagement_id },
-          });
+        // withEmit() (v1.3 parameterized) — entity update + event insert + outbox insert
+        // run in a single server-side Postgres transaction via emit_event_atomic().
+        await withEmit({
+          entityWrite: {
+            table: 'exceptions',
+            pk: exc.id,
+            update: { status: 'expired', expired_at: new Date().toISOString() },
+          },
+          event_type: 'exception.expired',
+          actor_type: 'inngest',
+          subject_type: 'exception',
+          subject_id: exc.id,
+          account_id: exc.account_id,
+          payload: { exception_id: exc.id, engagement_id: exc.engagement_id },
+          idempotency_key: `inngest:exception.expired:${exc.id}`,
         });
       });
     }
@@ -2946,6 +3104,16 @@ export async function renderTemplateWithSlots(
 ```
 
 If a contact is GDPR-deleted, tokens resolve to `(deleted)` and the UI displays redacted placeholder. Audit trail preserved; PII gone.
+
+#### CRM search capability — known constraint from tokenization (🟠 Fix 5/Round 4)
+
+Full tokenization (no raw names or emails in `contacts`) means SHA-256 hash lookup is the only available search mechanism within the `sensitive_data` table. SHA-256 lookup supports exact-match only: `SELECT token FROM sensitive_data WHERE value_hash = sha256('exact@email.com')`. Fuzzy, prefix, substring, and domain-suffix searches (e.g., "all clients named Marco" or "all clients from gmail.com") are not possible with this approach without either: (a) decrypting all values in application memory — O(N × fields), unsustainable at scale, or (b) a separate blind-index table using n-gram hashes (the CipherSweet pattern).
+
+**Accepted Stage 1 constraint:** at 225 clients, 95%+ of CRM lookups go through `accounts.company_name` (stored in plaintext — company names are public business entities, not personal PII). The CRM search bar searches `accounts.company_name`, `engagements.contract_type`, status fields, and creation date. Contact search by name is available as exact SHA-256 hash only (the admin types the full name or email and the system looks up whether that exact value exists). This covers "is this person already a contact?" but not "show me all contacts with the last name Rossi."
+
+**Stage 2 path:** a `contact_search_tokens` table using n-gram hashes (2-grams of the lowercased first/last name) enables prefix-match search without decrypting. Each name generates ~6-10 n-gram hashes; the search query hashes the prefix and looks for matches. This is a separate build not in Stage 0 scope.
+
+**This constraint is intentional, not an oversight.** The alternative — storing plaintext names in `contacts` for searchability and relying on encryption-at-rest only — would mean GDPR deletion requires rewriting the `contacts` row itself (leaking the name in undo logs, replication slots, and backups). Full tokenization achieves structural GDPR deletion. The search constraint is the cost of that guarantee.
 
 ### 14.2 RLS (Row-Level Security) policies
 
@@ -3363,11 +3531,13 @@ export const { GET, POST, PUT } = serve({
 Functions are defined as typed step functions:
 
 ```typescript
-// lib/inngest/functions/formation-pipeline.ts
+// lib/inngest/functions/formation-pipeline.ts — REVISED v1.3 (🔴 Fix 3/Round 4)
 export const formationPipeline = inngest.createFunction(
   { id: 'formation-pipeline', name: 'Formation Pipeline' },
   { event: 'engagement.started' },
   async ({ event, step }) => {
+    // engagement_id is now present on every engagement-scoped Inngest event
+    // because the drain injects it from row.subject_id (Fix 3).
     const engagementId = event.data.engagement_id;
 
     await step.run('verify-payment', async () => {
@@ -3378,26 +3548,32 @@ export const formationPipeline = inngest.createFunction(
       }
     });
 
+    // step.waitForEvent now resolves correctly because:
+    // (a) the triggering event (engagement.started) has data.engagement_id (injected by drain)
+    // (b) the waited-for event (requirement.satisfied) also has data.engagement_id (injected by drain)
+    // Both fields exist in the Inngest event data envelope; match works as intended.
     await step.waitForEvent('member-documents-received', {
       event: 'requirement.satisfied',
-      match: 'data.engagement_id',
+      match: 'data.engagement_id',   // ✅ field now present on both sides
       timeout: '7d',
       if: `event.data.requirement_key == 'member_passport'`,
     });
 
     await step.run('file-with-state', async () => {
-      // Invoke Harbor Compliance or direct state filing
-      // ...
-      await emit({
+      // Invoke Harbor Compliance or direct state filing.
+      // Uses withEmit() (parameterized) — no bare emit() calls exist in v1.3.
+      await withEmit({
         event_type: 'state_filing.submitted',
+        actor_type: 'inngest',
         subject_type: 'engagement',
         subject_id: engagementId,
-        actor_type: 'system',
+        account_id: event.data.account_id,
         payload: { filed_at: new Date().toISOString(), filing_id: '...' },
+        idempotency_key: `inngest:state-filing:${engagementId}`,
       });
     });
 
-    // Continue through EIN, OA, etc.
+    // Continue through EIN, OA, etc. — each step uses withEmit().
   }
 );
 ```
@@ -4069,9 +4245,18 @@ Before opening v2 to "all new clients," a pilot runs with 2-5 real new clients h
 
 **Per-client routing infrastructure.** During the pilot period, specific new clients are routed to v2 while all other new clients still route to v1. This requires routing to be deterministic and explicit — not "if date > X use v2" (which would route all clients at once) but "if contact.id IN pilot_list use v2."
 
+**REVISED v1.3 (🟠 Fix 7/Round 4): cross-database FK is impossible; email hash is the routing key.**
+
+v1.2 defined `client_routing.contact_id UUID REFERENCES contacts(id)`. This FK cannot exist: v1 and v2 are separate Supabase projects (separate Postgres instances). Postgres FKs do not span database instances. A v2 table cannot have a FK referencing v1's `contacts`, and a v1 table cannot reference v2's `contacts`. Any single-project placement leaves the other system without FK integrity or requires an expensive cross-project HTTP lookup on every offer.
+
+Fix: use email hash as the routing key. Email is known at lead-capture time (before a `contacts` row may exist in either system). No FK required — the routing table is a standalone lookup, not a reference to either contact table.
+
 ```sql
+-- Lives in v2 Supabase (Smart AI).
+-- v1 reads via HTTP call to GET /api/routing/check?email_hash=<sha256>
+-- No FK on either side — cross-database referential integrity is impossible by construction.
 CREATE TABLE client_routing (
-  contact_id    UUID PRIMARY KEY REFERENCES contacts(id),  -- or email hash pre-contact-creation
+  email_hash    TEXT PRIMARY KEY,   -- SHA-256(lower(trim(email))); stable across both systems
   system        TEXT NOT NULL CHECK (system IN ('v1', 'v2')),
   reason        TEXT NOT NULL,      -- 'pilot_cohort', 'new_client_post_cutover', 'migrated_feature:itin'
   assigned_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -4079,9 +4264,11 @@ CREATE TABLE client_routing (
 );
 ```
 
-The offer flow's first action on a new lead: look up `client_routing`. If a row exists → route accordingly. If no row → default to v1 pre-cutover, v2 post-cutover. Antonio (owner role) can insert pilot routing rows via the CRM without a deploy.
+The offer flow's first action on a new lead: compute `sha256(lower(trim(lead.email)))` → look up `client_routing`. If a row exists → route accordingly. If no row → default to v1 pre-cutover, v2 post-cutover. Antonio inserts pilot routing rows via the v2 CRM without a deploy.
 
-This infrastructure is the same mechanism used post-cutover for feature-by-feature migration of existing v1 clients: when an existing client's ITIN service migrates to v2, a row is inserted routing their ITIN engagement to v2 while their formation/renewal stays on v1.
+**v1 reads the routing table** via a lightweight HTTP call to the v2 routing endpoint (`GET /api/routing/check?email_hash=X`, protected by a shared secret). The v1 system does not query v2's Postgres directly. This is the only cross-system dependency during the pilot period.
+
+This infrastructure is the same mechanism used post-cutover for feature-by-feature migration of existing v1 clients: when a client's ITIN service migrates to v2, a row is inserted with `system='v2'` routing their ITIN-related offers to v2 while their formation/renewal stays on v1.
 
 ### 20.3 Cutover day protocol (2026-10-21) — REVISED v1.1 (🔴 Fix C: knowledge_articles + sop_runbooks migration)
 
@@ -4335,10 +4522,12 @@ Every major cost driver, sized honestly at three scale points. This is not a for
 - Uncached 40% stays at full price: $183.60.
 - Total input with caching: **$211**
 
-*With Batch API (10% of invocations at 50% off):*
-- Savings: 10% × ($211 input + $574 output) = $78.50 discount.
+*With Batch API (10% of invocations at 50% off) — CORRECTED v1.3 (🟡 Fix 8/Round 4):*
+- 10% of invocations run via Batch API. Their full-price cost: 10% × ($211 + $574) = $78.50.
+- Batch API gives 50% off that subset: $78.50 × 50% = **$39.25 savings**.
+- (v1.2 incorrectly subtracted $78.50 — the full cost — rather than 50% of it, overstating savings by ~$39/month.)
 
-*Final Claude API estimate: $211 + $574 - $78 = **~$707/month** at 225 clients.*
+*Final Claude API estimate: $211 + $574 − $39 = **~$746/month** at 225 clients.*
 
 **Other infrastructure:**
 - Inngest Pro: **$75/month** (base tier, expected to suffice at this volume).
@@ -4347,7 +4536,7 @@ Every major cost driver, sized honestly at three scale points. This is not a for
 - OpenAI embeddings: **~$10/month** (daily re-embeds of SOPs + scars, small corpus).
 - Sentry: **~$50/month** (team tier for error tracking + performance).
 
-**Total estimated cost at 225 clients: ~$1,067/month.**
+**Total estimated cost at 225 clients: ~$1,106/month.** (v1.2 stated $1,067 — the $39 Batch API correction flows through.)
 
 **Range with assumptions flex:** $900 (low end, fewer agent calls) to $1,400 (high end, more Opus usage).
 
@@ -4355,27 +4544,27 @@ Every major cost driver, sized honestly at three scale points. This is not a for
 
 Linear scaling for Claude API (agent work scales with client count):
 
-- Claude API: 500/225 × $707 ≈ **$1,571/month**.
+- Claude API: 500/225 × $746 ≈ **$1,658/month**.
 - Inngest: **$150-300/month** (scale into Pro tier overages).
 - Supabase Pro: $25 (Pro tier holds through much larger volumes).
 - Vercel Pro: **~$300/month** (more function invocations).
 - OpenAI embeddings: **~$20/month**.
 - Sentry: **~$80/month**.
 
-**Total at 500 clients: ~$2,146/month.**
+**Total at 500 clients: ~$2,233/month.**
 
 **Range:** $1,800 - $2,500.
 
 ### 22.4 Cost at 1,000 clients (target scale)
 
-- Claude API: 1000/225 × $707 ≈ **$3,140/month**.
+- Claude API: 1000/225 × $746 ≈ **$3,316/month**.
 - Inngest: **$400-600/month** (enterprise pricing, negotiated).
 - Supabase: may need to move beyond Pro to Team tier: **~$600/month**.
 - Vercel: **~$500-800/month** (enterprise).
 - OpenAI embeddings: **~$40/month**.
 - Sentry: **~$150/month**.
 
-**Total at 1,000 clients: ~$4,830-5,330/month.**
+**Total at 1,000 clients: ~$5,006-5,506/month.**
 
 **Range:** $3,500 (aggressive optimization) - $6,000 (unoptimized peak).
 
