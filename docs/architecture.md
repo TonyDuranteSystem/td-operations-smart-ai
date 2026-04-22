@@ -1516,4 +1516,430 @@ The resolution: post-cutover scar-source-6 (post-cutover incidents) explicitly o
 
 ---
 
-*(Plan continues. Remaining sections: Portal UX, CRM UX, Exception Handling, Business Rules, Security/PII, Claude API, Inngest, Infrastructure, Observability, Build Stages, Migration, Governance, Cost Model, Appendices A-E.)*
+---
+
+## 10. Client Portal Experience
+
+The portal is a solver-driven interface. Every page, every card, every action item is computed from the solver's output for the logged-in contact's engagements. Nothing about what a client sees is hardcoded per-service; it all comes from spec + state → solver → render.
+
+### 10.1 The core insight — portal is a rendering layer
+
+The portal does not "know" what Formation looks like. It renders whatever the solver says the current requirements are, for the current engagements the contact is part of. When a spec is updated (new requirement added, reminder cadence changed), the portal updates automatically because its render source — the solver — updates.
+
+This is the opposite of v1, where the portal has dedicated route handlers for each service type, each with its own logic for "what to show the client for a Formation engagement." Adding a new service type in v1 means: new routes, new components, new conditional branches. Adding a new service type in Smart AI means: new spec authored, seeded, solver evaluates it, portal renders its requirements — zero portal code changes.
+
+### 10.2 Authentication and session model
+
+The portal uses Supabase Auth. Contacts receive magic-link or email+password credentials. On successful auth:
+
+- `auth.uid` is the Supabase auth user ID.
+- The portal queries `contacts WHERE auth_user_id = $1` to find the contact.
+- From the contact, the portal queries active memberships: `account_members WHERE contact_id = $1 AND left_at IS NULL`.
+- From the memberships, the active engagements: `engagements WHERE account_id IN (...) AND status IN ('active','paused')`.
+- The portal renders one page per engagement plus a unified dashboard.
+
+RLS enforces at the DB level: the contact can only read rows for accounts they are an active member of. Policies detailed in Section 14.
+
+### 10.3 The adaptive dashboard
+
+When a client logs in, the landing page shows their engagement(s) at a glance. Layout:
+
+**Top: progress header per engagement.**
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Oh My Creatives LLC — Formation (MMLLC, New Mexico)                │
+│  ▓▓▓▓▓▓░░░░ 60% complete — 4 of 7 requirements satisfied            │
+│  Next: Upload passport for Marco Rossi                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Middle: action items.** Ordered by priority from `solver.next_actions`.
+
+```
+┌─ Action items for you ─────────────────────────────────────────────┐
+│                                                                    │
+│  1. 📄 Upload passport — Marco Rossi                               │
+│     Your MMLLC formation requires a passport for each member.     │
+│     [ Upload passport ]                                            │
+│                                                                    │
+│  2. 📄 Upload proof of address — Marco Rossi                       │
+│     A utility bill, bank statement, or government letter from     │
+│     the last 3 months.                                             │
+│     [ Upload document ]                                            │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Middle-lower: completed items.** Green checkmarks + dates.
+
+```
+┌─ Completed ────────────────────────────────────────────────────────┐
+│  ✓ Payment confirmed (April 15, 2026 — Stripe)                    │
+│  ✓ Company name: Oh My Creatives LLC                               │
+│  ✓ State of formation: New Mexico                                  │
+│  ✓ Passport uploaded — Giovanni Bianchi (April 18, 2026)          │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Bottom: blocked items with context.**
+
+```
+┌─ Waiting for us ───────────────────────────────────────────────────┐
+│  ⏳ State filing                                                    │
+│     We'll file with the New Mexico Secretary of State after we     │
+│     have all member documents. Expected turnaround after filing:   │
+│     5-10 business days.                                            │
+│                                                                    │
+│  ⏳ EIN application                                                 │
+│     Starts after the LLC is registered with the state.             │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+**Every element is rendered from `solver.requirements[]`:**
+- `status: 'missing'` + `type: 'document'` → action item with upload button.
+- `status: 'satisfied'` → completed card with the satisfying event's timestamp.
+- `status: 'blocked'` → waiting card with a plain-English "blocked_by" explanation derived from the blocking requirement's `display_name`.
+- `status: 'satisfied_by_exception'` → completed card with a subtle "waived" badge and the exception's reason (if client-visible).
+
+The spec's `follow_up_rules` and `action_hint` fields provide the plain-English text shown in each card. Rendering is a pure transformation: `StatusReport → React components`.
+
+### 10.4 Adaptive wizards
+
+When a client needs to provide data (onboarding fields, banking information, tax intake), the wizard is driven by the spec's requirements:
+
+- The wizard knows what the system already has. If the offer carried the client's address, the wizard pre-fills it. If a member was added by an admin, the members step shows them already populated.
+- The wizard only asks for what is actually missing per the solver.
+- For MMLLC formations, the members step is dynamic: add a member, remove a member, change ownership percentages, designate signer — all inline. Each member added emits `member.added`; each change emits `member.role_changed` or similar.
+- Per-member document sections appear automatically based on `per_member: true` requirements in the spec. Each member gets their own upload block.
+
+Wizard state is persisted to `wizard_progress` (a small table keyed by engagement + contact) so a client can close the browser and come back to the same step. On close/refresh, the wizard reads the latest solver output and skips any step whose requirement is now satisfied.
+
+### 10.5 Real-time updates
+
+When an admin updates something in the CRM — approves an exception, marks a requirement satisfied manually, moves a stage — the portal updates immediately via Supabase Realtime.
+
+Mechanism:
+1. Admin action emits event (e.g., `exception.approved`).
+2. Outbox drain publishes to Supabase Realtime on a channel keyed to the affected `(engagement_id, account_id)`.
+3. Portal page for that engagement has subscribed to the channel on mount.
+4. Portal receives the event, invalidates local solver cache, re-fetches solver output, re-renders.
+
+Latency target: from admin click to portal update, < 3 seconds at p95. Realtime is not a hard dependency — if Realtime is down, the portal still works (30-second polling fallback). Realtime is the ideal; polling is the floor.
+
+### 10.6 Unified timeline
+
+Each client sees a complete chronological history of their engagement: documents uploaded, contracts signed, payments confirmed, messages exchanged, AI decisions (when client-visible), proposals approved, exceptions granted, deadlines met.
+
+Source: the event log, filtered by subject scope (`subject_id IN (engagement_id, account_id, member_contact_ids)` AND visibility predicate).
+
+Visibility predicate:
+- Client-visible events: `payment.confirmed`, `document.uploaded`, `account.formation_confirmed`, `account.ein_received`, `communication.sent` (to this contact), `member.added`, `exception.approved` (when exception is client-visible), `engagement.started`, `engagement.completed`.
+- Admin-only events (hidden from client timeline): `ai.decision`, `proposal.created/approved/rejected`, `webhook.received`, `agent.invoked`, some `exception.approved` (when the exception concerns internal policy the client need not see).
+
+Each event in the timeline renders with:
+- Icon by event type.
+- Short description (from a mapping table keyed by event_type).
+- Timestamp in the client's timezone.
+- Optional expand for detail (e.g., which document was uploaded, which payment method).
+
+### 10.7 Portal chat
+
+The portal has an integrated chat interface for the client to communicate with TD (Antonio, Luca). Message history lives in `portal_messages` (carried forward from v1 with R100 soft-delete semantics preserved: `deleted_at`, `deleted_by`, server-filters non-admin queries).
+
+Each inbound message emits `communication.received` with channel='portal_chat'. The Ops Agent (once Stage 1 adds Portal-Support responsibility) can draft suggested responses that Antonio/Luca review and send.
+
+For first cutover, portal chat is routed to admin (no auto-response). Portal-Support agent responses are Stage 1+.
+
+### 10.8 Portal rationale and devil's-advocate flags
+
+**[R101-FLAG on solver latency on portal page load.]** If every portal page load calls the solver, and the solver is complex for a multi-engagement account, p95 latency suffers. Clients see spinners.
+
+The resolution: solver cache hits are O(1) DB read. First-load latency may be 200-500ms (solver fresh run); subsequent loads should hit cache. Monitoring: p95 portal-page-load target is < 1 second; cache-hit-rate target is > 80% after 1 hour of activity per engagement.
+
+**[R101-FLAG on Realtime connection limits at scale.]** Supabase Pro has connection limits. At 1,000 clients with potentially overlapping sessions (client + admin viewing the same engagement), total concurrent Realtime connections can spike.
+
+The resolution: each page subscribes to a specific channel (engagement-scoped), not a global channel. Connection count is bounded by active UI sessions, not by total clients. Upgrade tier if needed; cost is small.
+
+**[R101-FLAG on timeline PII.]** The timeline shows events, and events reference documents. If a member deletes a passport from their profile, the event `document.uploaded` remains in the timeline. Does the document's visibility need to be revocable?
+
+The resolution: the timeline renders via a visibility join — the event references a document, the document has a `visibility` field (default: visible to all members of the account). If admin marks a document private, it disappears from the member timeline (but stays in admin view). Soft-delete semantics also apply. Timeline is a render projection, not a raw dump.
+
+**[R101-FLAG on wizard progress when spec changes.]** A client is mid-wizard. An admin edits the spec (adds a new required document). What happens to the client's progress?
+
+The resolution: the wizard's effective spec is pinned to `engagement.spec_version`. New spec versions do not affect in-progress wizards. If the admin wants to retroactively apply, the admin explicitly migrates the engagement (Section 6.6) — which emits a migration event and re-invalidates wizard progress.
+
+---
+
+## 11. Admin CRM Experience
+
+The CRM is the internal operations dashboard for Antonio and Luca. It presents the same solver output as the portal but from the administrator's angle: across all clients, prioritized by what needs attention, surfaced with AI-generated context.
+
+### 11.1 Intelligence-first dashboard
+
+The CRM home page is organized by what needs attention, not by entity type. v1's CRM dashboard is organized by "Accounts | Contacts | Tasks | Deadlines" — useful when browsing, useless when acting. Smart AI inverts this:
+
+```
+┌─ Today, 22 April 2026 ─────────────────────────────────────────────┐
+│                                                                    │
+│  Needs Action (12)                                                 │
+│  ├── 8 clients have missing documents over 3 days                 │
+│  ├── 3 clients at payment-confirmed but not yet activated          │
+│  └── 1 client exception awaiting your approval                    │
+│                                                                    │
+│  Proposals (7)                                                     │
+│  ├── 4 reminder emails ready (high confidence, auto-approvable)    │
+│  ├── 2 invoices to send (review recommended)                       │
+│  └── 1 stage advance proposal (requires your review)               │
+│                                                                    │
+│  Blocked (6)                                                       │
+│  ├── 4 clients waiting on state filing confirmation                │
+│  ├── 2 clients waiting on IRS EIN                                  │
+│  └── (Dependencies external; follow up via Harbor Compliance)      │
+│                                                                    │
+│  Anomalies (2)                                                     │
+│  ├── FBC Consulting: exception rejected 3x, pattern forming       │
+│  └── Integration alert: 1 webhook failing (Whop, 2 retries left)   │
+│                                                                    │
+│  Healthy (234)  — no action needed                                 │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+Each row is clickable, drills into a filtered list. Counts update in realtime.
+
+This is powered entirely by solver output aggregated across engagements:
+- **Needs Action**: engagements with `next_actions` targeting admin, ordered by how long they've been waiting.
+- **Proposals**: `proposals` table filtered to `status='pending'`, sorted by confidence and blast_radius.
+- **Blocked**: engagements with `requirements[].status='blocked'` by an external dependency.
+- **Anomalies**: heuristic — exception-rejected patterns, stuck evaluations, failed webhooks, agent-cost spikes.
+- **Healthy**: engagements where all requirements are `satisfied` or the next action is client-scoped (admin has no task).
+
+### 11.2 Client 360 view
+
+One screen per account with everything. The structure:
+
+**Header**: company name, entity type, state, status badge, client health, portal tier, created date.
+
+**Left sidebar**: tabs for All Engagements, All Members, All Documents, All Payments, Timeline, Chat, Notes, Audit.
+
+**Main area** (depending on tab):
+
+- **All Engagements**: list of engagements with each one's progress bar and current action. Click into an engagement for its full solver report.
+- **All Members**: list of `account_members` (active and historical — with filters). Per-member document status, role, ownership. Add/remove/change.
+- **All Documents**: filterable list with type, contact (if per-member), uploaded date, classification confidence.
+- **All Payments**: full payment history with invoice numbers, status, method, amounts.
+- **Timeline**: unified chronological event feed across all engagements for this account. Same event source as the portal timeline but with admin-visible events included (AI decisions, proposals, exceptions).
+- **Chat**: portal messages from/to this account.
+- **Notes**: free-text admin notes (preserved from v1 pattern).
+- **Audit**: action log — every write that touched this account or its related entities, with timestamp + actor.
+
+**Right sidebar** (always visible): **AI Context Panel.**
+
+The AI Context Panel is the Ops Agent's live summary of what's happening with this client. It includes:
+
+- **Plain-English state summary.** "Oh My Creatives is at 60% of MMLLC formation. Waiting for passports from 2 of 3 members. Last activity: passport uploaded for Giovanni Bianchi 3 days ago. No exceptions active."
+- **Most recent activity** (last 5 events, summarized).
+- **What needs attention.** "Marco Rossi's passport has been missing for 8 days. Reminder cadence says one was sent April 18; next reminder due April 25."
+- **Anything unusual.** "This is the third MMLLC this quarter with member documents delayed >5 days. Pattern forming — consider adjusting onboarding flow."
+
+The panel is refreshed via the solver cache + Realtime event subscription. Antonio does not ask the AI for this context — it's pre-computed and cached, visible the moment he opens the page.
+
+### 11.3 Spec Editor
+
+A dedicated page at `/admin/specs` where service specifications are viewed and edited.
+
+**Specs list view:**
+- Each spec with its current version, last edited, last edit by, active engagement count using this spec.
+- Click to edit.
+
+**Spec edit view (two tabs):**
+
+**Tab: Values** — runtime-editable via `rule_overrides`.
+- Pricing rules (base prices, per-state filing fees, per-member multipliers).
+- Follow-up cadences (first reminder days, escalation days).
+- Exception configurations (who can override what, with what alternative).
+- Constants used in conditions.
+
+Each editable value has: current effective value, current override (if any), proposed new value field, effective-from date, reason, save button. Saving emits `rule_override.created`; effective spec is re-resolved immediately.
+
+**Preview dry-run:** before saving, the UI shows "if I save this, here's what changes in existing engagements." Example: "Raising base price of SMLLC from $999 to $1,199 will affect 0 existing engagements (all are version-pinned). Will affect new SMLLC offers from [effective_from date]." This confirms Antonio that his intent matches the system's interpretation.
+
+**Tab: Structure** — read-only.
+- Requirements tree with dependency graph.
+- Each requirement: type, key, condition, scope, ai_evaluable flag.
+- "Propose structural change" button creates a dev_task describing the desired change. Requires code change + deploy.
+
+**Version history:** see what changed, when, who changed it. Full audit trail via `spec.updated` + `rule_override.created` events.
+
+### 11.4 Proposal inbox
+
+A dedicated page at `/admin/proposals` for AI-generated proposals.
+
+**List view:**
+- Sorted by priority, urgency, and age.
+- Each proposal shows: action type, target account/engagement, rationale, confidence, evidence events (expandable), blast_radius, alternative considered, weakness acknowledged, scar matches.
+- One-click approve or reject with optional reason.
+
+**Batch operations:**
+- Select all proposals of the same type (e.g., "send reminder email") with confidence ≥ threshold.
+- Approve selected (batch) — emits `proposal.approved` for each + triggers each action workflow.
+
+**History tab:**
+- Past proposals with their disposition (approved, rejected, auto-executed, expired).
+- Filter by type, account, outcome, agent.
+- Analytics: approval rate per type, average review time, auto-approval candidates (types with high consistent approval that could move to auto-execute at higher threshold).
+
+**Inline scar context:**
+- Each proposal's detail view shows the scar matches the agent considered. If any scar was a potential blocker and the agent reasoned past it, that reasoning is visible. Admin can challenge: "is that reasoning valid?"
+
+### 11.5 Exception handling UI
+
+The exception flow is explicit, auditable, and fast — matching Antonio's vision that "exceptions are a core feature, not workarounds."
+
+**On a client 360 view, for any requirement:**
+- If `status: 'missing'` or `'blocked'`, admin clicks **Override**.
+- Modal opens showing: requirement details, what would satisfy it normally, what exception types are allowed for this requirement (from `exceptions_config`), who is authorized, whether a reason is required, whether an alternative document/evidence is required.
+- Admin selects exception type, enters reason, optionally attaches alternative evidence.
+- Click **Grant Exception** → emits `exception.approved` with full payload. Solver re-evaluates immediately. Requirement status transitions to `satisfied_by_exception`. Downstream requirements unblock.
+
+**Exception list view (at `/admin/exceptions`):**
+- All active exceptions across all engagements.
+- Filterable by requirement key, approved_by, date range.
+- Each exception shows: which requirement, for which engagement, approved by whom, when, reason, expiry (if set), evidence.
+- Revoke button — emits `exception.revoked`; solver re-evaluates; if the revocation unsatisfies the requirement, downstream requirements re-block.
+
+**Pattern detection:**
+- If the same requirement key is overridden for ≥5 engagements within the last 90 days with similar reasons (via pgvector similarity on reason text), a banner appears in the spec editor for that requirement: "Exception pattern forming. Consider updating the spec or exception config."
+- Gives Antonio the signal to move the business logic from "we keep overriding" to "this isn't actually required here."
+
+### 11.6 CRM rationale and devil's-advocate flags
+
+**[R101-FLAG on AI Context Panel accuracy.]** The panel is LLM-summarized. If the summary misrepresents the state (says "waiting for passports" when actually all passports are in but there's a different blocker), Antonio acts on wrong information.
+
+The resolution:
+1. The panel's summary is structured — it doesn't just free-text summarize; it renders from a stable template populated by solver output. The LLM does not freely narrate; it fills slots.
+2. Every claim in the panel is clickable — hover shows the underlying solver field; click opens the evidence.
+3. The panel explicitly marks AI-generated parts vs deterministic parts.
+
+**[R101-FLAG on batch-approving proposals.]** Admin clicks "approve all 4 reminder emails" — if one of them has a scar match that the admin missed, the bad proposal ships with the good ones.
+
+The resolution: the batch approve UI requires a confirmation step showing all proposals with their scar_matches highlighted. If any proposal has a scar match, it is excluded from the batch by default — admin must explicitly re-include. One-click mass approval is for the clean cases; scar-flagged cases require individual review.
+
+**[R101-FLAG on exception pattern detection.]** Detection is based on similarity, which can false-positive (different underlying reasons phrased similarly) or false-negative (same reason phrased differently).
+
+The resolution: pattern detection surfaces a *signal*, not an automatic change. Antonio decides whether the pattern is real. The banner is informational; it doesn't auto-edit the spec. If false-positive, Antonio dismisses; if false-negative, a Stage 2+ improvement is to add explicit "reason tags" that admins select when granting exceptions, making patterns more discoverable.
+
+**[R101-FLAG on spec editor preview accuracy.]** The "if I save this, here's what changes" preview is only as accurate as the system's knowledge of what depends on the spec value. If a downstream consumer reads the spec in a way the preview doesn't anticipate, the preview is wrong.
+
+The resolution: the preview is generated by actually running the solver in dry-run mode against all active engagements using this spec, with the proposed override applied. The diff between current-solver-output and dry-run-solver-output is the preview. This is computed deterministically — no LLM involved — and uses the same solver code path that the live system uses. If the live system's dependency is captured in the solver (which it should be, because solver is the source of truth), the preview catches it. If there's a dependency outside the solver, that's a bug the scar index captures as `rule_as_prose`.
+
+---
+
+## 12. Exception Handling — The Heart of Flexibility
+
+This is what makes the system fundamentally different from the original. Exceptions are not errors. They are not workarounds. They are a **core feature** of the system, recorded as first-class data with full audit.
+
+### 12.1 The principle
+
+Antonio's words: *"I want a system more flexible that can accept the exception instead of hardly demand to have, for example in this case a 'placeholder.' A lot of things in this system must follow an order according to the code. This is hard to manage and I feel like in a box where I can't move or decide something different if it doesn't reflect the code."*
+
+The translation: the system should not fight Antonio's decisions. It should record them, respect them, and move on. But it should also remember.
+
+### 12.2 Exception schema
+
+```sql
+CREATE TABLE exceptions (
+  id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  engagement_id        UUID NOT NULL REFERENCES engagements(id),
+  requirement_key      TEXT NOT NULL,                     -- which requirement is overridden
+  requirement_scope    JSONB,                             -- for per_member requirements, the specific member contact_id
+  exception_type       TEXT NOT NULL CHECK (exception_type IN ('skip','defer','substitute','override_value')),
+  status               TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','revoked')),
+  approved_by          UUID NOT NULL,                     -- auth.users.id
+  approved_by_name     TEXT,                              -- denormalized for display
+  reason               TEXT NOT NULL,                     -- free-form explanation
+  evidence             UUID[] DEFAULT '{}',               -- referenced event IDs or document IDs
+  alternative_value    JSONB,                             -- for 'substitute' and 'override_value' types
+  expires_at           TIMESTAMPTZ,                       -- NULL = permanent
+  created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at           TIMESTAMPTZ,
+  revoked_by           UUID,
+  revocation_reason    TEXT
+);
+
+CREATE INDEX idx_exceptions_active ON exceptions(engagement_id, requirement_key) WHERE status = 'active';
+CREATE INDEX idx_exceptions_requirement_pattern ON exceptions(requirement_key, created_at DESC);
+```
+
+### 12.3 Exception types
+
+- **`skip`** — the requirement doesn't apply to this engagement. Example: "This client is a returning client; welcome_package skipped."
+- **`defer`** — the requirement will be met later, but shouldn't block downstream requirements now. Has `expires_at`; if not satisfied by the deadline, the exception auto-expires and the requirement becomes blocking again.
+- **`substitute`** — the requirement can be satisfied by an alternative piece of evidence. Example: "Passport not available; driver's license + utility bill + sworn statement serve as alternative. alternative_value = { docs: [doc_id1, doc_id2, doc_id3] }."
+- **`override_value`** — for `ReqData` requirements, provide an explicit value that bypasses the condition. Example: "account.state_of_formation is 'other' (spec condition: must be in supported states); override with alternative_value = 'Massachusetts' and accept manual handling."
+
+### 12.4 Exception lifecycle
+
+**Creation:**
+1. Admin (or agent via `exception.requested`, which requires human approval) identifies a requirement that cannot be satisfied normally.
+2. Admin clicks Override on the CRM requirement.
+3. Selects exception_type from the spec's `exceptions_config` for this requirement (which types are allowed, by whom, with what alternative).
+4. Enters reason. If spec requires alternative evidence, attaches it.
+5. Save → emits `exception.approved` + inserts row in `exceptions` (status='active').
+6. Solver cache invalidates for the affected engagement. Next solver call returns the requirement with `status='satisfied_by_exception'`. Downstream requirements unblock.
+
+**Expiration:**
+- Cron daily checks for `exceptions where status='active' and expires_at < now()`.
+- Emits `exception.expired` for each; updates row to `status='expired'`.
+- Solver re-evaluates; requirement reverts to previous status; downstream re-blocks.
+
+**Revocation:**
+- Admin manually revokes an active exception via UI.
+- Emits `exception.revoked`; updates row to `status='revoked'` with `revoked_at`, `revoked_by`, `revocation_reason`.
+- Solver re-evaluates.
+
+### 12.5 Exception authorization
+
+`exceptions_config` in the spec defines, per requirement:
+- `overridable: true/false`
+- `overridable_by`: array of roles or user identifiers (e.g., `['antonio']` for owner-only, `['antonio','luca']` for both admins).
+- `requires_reason: true/false` (default true).
+- `requires_alternative_document: true/false` (for `substitute` type).
+- `max_defer_days`: if `defer` type, hard cap on how long an exception can be deferred.
+- `prohibited_exception_types`: sometimes certain types aren't allowed for certain requirements (e.g., EIN cannot be `skip`; it can only be `defer` with evidence of alternative identification or legal justification).
+
+At exception-creation time, the CRM validates the admin's user against the spec's `exceptions_config`. If not authorized, the UI prevents creation. The server-side API also validates. No way to create an exception that the spec didn't authorize.
+
+### 12.6 Exception pattern detection
+
+The system watches for exception patterns at two levels:
+
+**Per-requirement frequency:** if `requirement_key=X` is overridden across ≥5 engagements in 90 days, surface a pattern banner in the spec editor. Antonio sees: "This requirement is being overridden often. Consider: (a) relaxing the spec, (b) requiring an alternative upfront instead of as exception, (c) investigating why clients can't satisfy this."
+
+**Per-reason similarity:** via pgvector embedding on exception reasons. If ≥5 exceptions cluster on similar reason text, surface the pattern with the reason cluster as representative text. This catches cases like "this state doesn't support Single-Member LLC by default" being overridden multiple times with varying wording — the pattern is detectable via semantic similarity, not string match.
+
+### 12.7 Exception rationale and devil's-advocate flags
+
+**[R101-FLAG on exception abuse.]** If exceptions are easy to grant, admins will use them as the default workaround rather than fixing the underlying spec. The system ends up with spec requirements that exist on paper but are never enforced in practice.
+
+The resolution:
+1. **Pattern detection** (Section 12.6) surfaces this automatically.
+2. **Exception weekly report** (in the admin dashboard) shows exception count per admin per week. If one admin is granting 30+ exceptions/week, that's a signal.
+3. **Spec values are easier to change than exceptions are to grant.** The CRM spec editor is a faster path than the exception modal for values that should apply systemically. Training: "if you override X more than twice, it's probably a spec issue."
+
+**[R101-FLAG on expired exceptions with live engagements.]** An exception expires while an engagement is mid-flight, re-blocking a downstream requirement the client thought was resolved.
+
+The resolution:
+1. Exception expiry fires an event → triggers a workflow → notifies admin (not client) immediately.
+2. Admin sees: "Exception for X on engagement Y expired. Requirement is now re-blocking. Options: re-grant, accept block, investigate."
+3. Client-side render: the portal doesn't re-expose the "you need this" message until admin decides. Dampening layer prevents client whiplash.
+
+**[R101-FLAG on exception-generated false "satisfied" state.]** If an exception is granted, the requirement shows satisfied_by_exception. A naive consumer treating all satisfied statuses uniformly might miss that an exception is involved.
+
+The resolution:
+1. All downstream consumers (CRM panels, portal render, agent context) explicitly render exception-backed satisfaction differently from normal satisfaction. Visual marker. The agent's context bundle distinguishes them.
+2. Reports and analytics treat them as distinct: "N requirements satisfied, of which M are by exception."
+
+---
+
+*(Plan continues. Remaining sections: Business Rules, Security/PII, Claude API, Inngest, Infrastructure, Observability, Build Stages, Migration, Governance, Cost Model, Appendices A-E.)*
