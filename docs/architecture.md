@@ -1942,4 +1942,1769 @@ The resolution:
 
 ---
 
-*(Plan continues. Remaining sections: Business Rules, Security/PII, Claude API, Inngest, Infrastructure, Observability, Build Stages, Migration, Governance, Cost Model, Appendices A-E.)*
+---
+
+## 13. Business Rules — The Honest Split
+
+Not all rules can be data. Not all rules should be code. Smart AI makes the split explicit. There are three buckets, in descending order of editability and ascending order of expressive power.
+
+### 13.1 Rules as data (90% of rules)
+
+These live in database tables and are editable through the CRM without a deploy. The canonical buckets:
+
+**Pricing rules** (in `service_specs.pricing_rules` + `rule_overrides`):
+- Base price by entity type (SMLLC, MMLLC, C-Corp Elected).
+- Filing fees by state.
+- Per-member multipliers for MMLLC.
+- Partner code discounts.
+- Setup fees.
+- Installment schedules (2-payment, 4-payment) with per-installment amounts and due-date cadence.
+
+**Document requirements** (in `service_specs.requirements[]`, each `ReqDocument`):
+- Which documents are needed per entity type.
+- Which are per-member vs per-account.
+- Conditional requirements (e.g., "proof of income required only for specific states").
+
+**Follow-up cadences** (in `service_specs.follow_up_rules`):
+- First-reminder days (e.g., send reminder 3 days after requirement detected missing).
+- Subsequent-reminder cadence (e.g., every 7 days).
+- Maximum reminders before escalation.
+- Escalation-to-admin thresholds.
+
+**Gating rules** (in spec requirements via `depends_on` and `blocks`):
+- Which requirements block which.
+- Which are hard gates (payment blocks everything) vs soft dependencies.
+
+**Communication templates** (in `communication_templates` table):
+- Language (en, it, es, etc.).
+- Event type (which event triggers this template).
+- Channel (email, portal_notification).
+- Subject + body with interpolation markers.
+- Soft-delete semantics (templates can be archived without losing historical sends).
+
+**Exception configurations** (in spec + `rule_overrides`):
+- Which requirements are overridable.
+- By whom.
+- With what alternative.
+- Max defer period.
+
+All of the above are editable in the CRM by Antonio. Changes are audited (`rule_override.created` events), versioned, and pinned where they should be (pricing pins to engagement at creation; reminder cadences apply prospectively).
+
+### 13.2 Rules as named TypeScript functions (10% of rules)
+
+Some rules genuinely require code because they involve non-trivial computation or reach beyond data the CRM can sensibly represent. These are small, well-defined TypeScript functions in `lib/rules/`. Each has:
+- A clear input/output type contract.
+- A test file with edge case coverage.
+- A registry entry so it's discoverable.
+- A limit of ~50 lines per function.
+
+Examples:
+
+```typescript
+// lib/rules/extension-deadline.ts
+/**
+ * Computes the IRS extension deadline for a given entity and tax year.
+ * - SMLLC (disregarded, Schedule C): extension to October 15.
+ * - MMLLC (1065 partnership): extension to September 15.
+ * - C-Corp Elected (1120): extension to October 15.
+ */
+export function computeExtensionDeadline(entityType: EntityType, taxYear: number): Date {
+  const monthDay = {
+    'Single Member LLC': { month: 10, day: 15 },
+    'Multi Member LLC': { month: 9, day: 15 },
+    'C-Corp Elected': { month: 10, day: 15 },
+  }[entityType];
+  if (!monthDay) throw new RulesError(`No extension rule for entity type ${entityType}`);
+  return new Date(taxYear + 1, monthDay.month - 1, monthDay.day);
+}
+```
+
+```typescript
+// lib/rules/post-september.ts
+/**
+ * Determines if a formation signed after Sep 1 qualifies for the
+ * first-year-skip on the January installment (SOP rule P5).
+ */
+export function appliesPostSeptemberRule(contractSignedDate: Date, year: number): boolean {
+  const cutoff = new Date(year, 8, 1);  // Sep 1 of the same year
+  return contractSignedDate >= cutoff;
+}
+```
+
+```typescript
+// lib/rules/installment-amounts.ts
+/**
+ * Splits an annual fee into installment amounts given a schedule.
+ */
+export function computeInstallmentAmounts(
+  annualFee: number,
+  schedule: InstallmentSchedule
+): InstallmentAmount[] { /* ... */ }
+```
+
+**These functions are the escape hatch for logic that genuinely needs code.** They are:
+- Named (not anonymous, not scattered).
+- Bounded (each < 50 lines; if longer, decompose).
+- Registered (imported in `lib/rules/index.ts` which exports a registry consumed by the spec engine).
+- Testable in isolation.
+
+When a rule needs to change, you know exactly where. When a new rule is needed, you add a function + test + registry entry; no sprawl.
+
+### 13.3 Rules interpreted by AI (the remaining edge cases)
+
+For rules too context-dependent for data tables and too varied for small TypeScript functions, the Ops Agent interprets relevant SOPs at runtime. These are exceptional and require review to flag `ai_evaluable`. Candidates:
+
+- **Eligibility determinations with multiple conditional branches.** Example: "Is this client eligible for the treaty-based ITIN fast-track?" — depends on citizenship, tax residency, prior year returns, visa status, case-specific context.
+- **Prioritization decisions across clients with competing deadlines.** Example: "Given 5 clients with tax returns due in 10 days and 3 awaiting extension filing, which should the team work first?" — depends on complexity, client health, payment status, size of tax exposure.
+- **Exception-pattern evaluation.** "Should this exception request be granted based on precedent from similar clients?" — LLM reasons over the reason text + historical pattern.
+
+The agent's interpretation is always:
+- **Recorded as an event** (`ai.decision`).
+- **Auditable** — the full context bundle hash, retrieved SOP citations, output reasoning are stored.
+- **Subject to approval when confidence is below threshold**.
+- **Calibrated over time** — the observability stack tracks (AI confidence, actual accuracy) pairs to adjust thresholds.
+
+### 13.4 The rules-architecture contract
+
+The three-tier split is not a gradient; it's a strict hierarchy enforced in code:
+
+1. **Data rules** are the default. If a rule can be represented as editable values in a spec, it must be.
+2. **Code rules** require explicit registration. A function in `lib/rules/` is reviewed; the PR author justifies why data isn't sufficient.
+3. **AI rules** require explicit `ai_evaluable` flag on a spec requirement. The PR author justifies why neither data nor code is sufficient, provides at least 5 example cases with expected AI outputs, and sets an acceptable confidence threshold.
+
+The scar index tracks cases where the wrong tier was chosen and surfaces them. If an AI-interpreted rule's admin-approval rate is below 90% consistently, that's a signal the rule should move to code (if the logic is determinable) or to data (if it's really a configurable value). The tier choice is reviewable evidence, not a one-time decision.
+
+### 13.5 Specific rules carried forward from v1
+
+These v1 rules have business-level force and must exist in v2 in some tier. Listed with their target tier:
+
+- **R094** (leads.status='Converted' means payment confirmed, not offer signed): **data** — enforced by the event-emission path (`lead.converted` fires only from payment webhooks, not offer-signing). Becomes a structural invariant, not a prose rule.
+- **R097** (QB sync manual-only): **data** — QB sync is a separate button in CRM; no automatic triggers. The invoice-number generator (R098) produces canonical numbers; any QB sync consumes them without minting.
+- **R098** (invoice-number race safety via unique constraint, not code retry loop): **schema** — DB unique constraint + caller retry on conflict. Same pattern as v1.
+- **R099** (surface server errors on client fetch): **code pattern** — every client-side `fetch` to own APIs must parse error body and surface. Linted.
+- **R100** (client-visible deletion = soft-delete): **schema + code pattern** — `deleted_at`, `deleted_by` columns + server-side filtering. Linted.
+- **R037** (MCP send tools use safeSend): **code pattern** — still applies to outbound email via the agent. The `send_via_safe_send` tool wraps idempotency check + send + post-send tracking in one atomic path.
+- **R041** (RFC 2047 email subject encoding): **code pattern** — every email send path uses a typed helper that base64-encodes non-ASCII. Enforced by unit test: any direct MIME assembly without the helper fails.
+
+Each of these becomes a scar with its prevention captured. v2 doesn't "follow R037 because we wrote it"; v2 makes R037 impossible to violate via the type system and the enforced helper.
+
+### 13.6 Rules rationale and devil's-advocate flags
+
+**[R101-FLAG on spec editor access control.]** Antonio can edit any rule value. What about Luca? The business may need finer-grained permissions — some values Luca can edit (cadences), some he can't (pricing).
+
+The resolution: every `rule_overrides` insert is authorized against a `rule_path_policy` table that says "path X is editable by role Y." Default: pricing paths require owner role; cadence paths allow admin role. Configurable per-deployment. First cutover has Antonio as owner, Luca as admin; extensions are a Stage 3+ feature.
+
+**[R101-FLAG on migration of v1 rules.]** v1 has rules in CLAUDE.md, sop_runbooks, knowledge_articles, and scattered code. v2 needs to decide, for each rule, what tier it lands in and who owns that placement.
+
+The resolution: the scar index population process (Section 9.4) is also the rule-mapping process. Each v1 rule, as it becomes a scar, is classified by the target tier. The resulting spreadsheet (effectively, the scar table with additional columns) is the migration checklist.
+
+**[R101-FLAG on ai_evaluable rule quality over time.]** AI rules are the most expensive tier (model cost + review cost + calibration complexity). They also have the worst worst-case (hallucination, bias, drift). If the system tends to add more `ai_evaluable` rules over time, complexity spirals.
+
+The resolution: the auto-approval threshold measurement is the governor. When an `ai_evaluable` rule's admin approval rate falls below 90% and stays there, a dev_task is created: "Review whether this rule should move to code or data." The rule isn't removed, but the question is raised. This is institutional hygiene.
+
+---
+
+## 14. Security, PII, Compliance
+
+Designed upfront, not retrofitted. PII tokenization is a line-one decision; RLS policies are specified before any table seeding; webhook signatures are verified on every inbound call. The system assumes adversarial conditions and defends explicitly.
+
+### 14.1 PII tokenization model
+
+Raw PII never lives in event payloads, log lines, or most application tables. Instead:
+
+```sql
+CREATE TABLE sensitive_data (
+  token             TEXT PRIMARY KEY,                     -- opaque identifier, e.g., 'sd_a7f8c2b1'
+  subject_type      TEXT NOT NULL,                        -- 'contact' | 'account' | 'engagement'
+  subject_id        UUID NOT NULL,
+  data_type         TEXT NOT NULL CHECK (data_type IN (
+    'passport_number','itin','ein','ssn','dob','address','bank_account','phone'
+  )),
+  encrypted_value   TEXT NOT NULL,                        -- pgcrypto AES-256 encrypted
+  value_hash        TEXT NOT NULL,                        -- SHA-256 hash for lookup without decryption
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_accessed_at  TIMESTAMPTZ,
+  access_count      INTEGER NOT NULL DEFAULT 0,
+  created_by        UUID NOT NULL
+);
+
+CREATE INDEX idx_sensitive_data_subject ON sensitive_data(subject_type, subject_id, data_type);
+CREATE INDEX idx_sensitive_data_hash ON sensitive_data(value_hash);
+```
+
+Tables that reference PII hold the token, not the value:
+
+```sql
+-- Instead of: contacts.passport_number TEXT
+contacts.passport_number_token TEXT REFERENCES sensitive_data(token);
+
+-- Event payload for 'account.ein_received' includes:
+-- { ein_token: 'sd_f3a9...', received_date: '2026-04-15' }
+-- NOT: { ein_number: '12-3456789' }
+```
+
+Reading PII:
+- A service-role-level Postgres function `get_sensitive_value(token, purpose)` takes a token + a documented purpose string, checks the caller's role, logs the access (`access_count++`, `last_accessed_at`), decrypts and returns.
+- Application code uses this function only when PII is needed (rendering in admin UI, generating a signed PDF, making an API call to an external service that requires raw value). Otherwise code passes tokens around.
+- Agents do not have access to PII values. They see redacted representations (e.g., passport token → "passport-on-file" marker without the number).
+
+### 14.2 RLS (Row-Level Security) policies
+
+Every client-facing table has explicit RLS policies. Portal (client-facing) access is scoped through an auth chain:
+
+```
+auth.uid → contacts.auth_user_id → account_members.contact_id (where left_at IS NULL) → account_id
+```
+
+Policies for key tables:
+
+```sql
+-- Engagements: portal contact sees engagements for accounts they actively belong to
+CREATE POLICY engagements_portal_select ON engagements
+FOR SELECT USING (
+  EXISTS (
+    SELECT 1 FROM contacts c
+    JOIN account_members am ON am.contact_id = c.id AND am.left_at IS NULL
+    WHERE c.auth_user_id = auth.uid() AND am.account_id = engagements.account_id
+  )
+  OR engagements.contact_id IN (
+    SELECT c.id FROM contacts c WHERE c.auth_user_id = auth.uid()
+  )
+);
+
+-- Events: portal contact sees events where the subject is an entity they have access to
+CREATE POLICY events_portal_select ON events
+FOR SELECT USING (
+  CASE events.subject_type
+    WHEN 'engagement' THEN events.subject_id IN (
+      SELECT e.id FROM engagements e
+      JOIN account_members am ON am.account_id = e.account_id AND am.left_at IS NULL
+      JOIN contacts c ON c.id = am.contact_id
+      WHERE c.auth_user_id = auth.uid()
+    )
+    WHEN 'account' THEN events.subject_id IN (
+      SELECT am.account_id FROM account_members am
+      JOIN contacts c ON c.id = am.contact_id
+      WHERE c.auth_user_id = auth.uid() AND am.left_at IS NULL
+    )
+    ELSE false
+  END
+);
+
+-- And so on for documents, payments, members, invoices, etc.
+```
+
+Admin access bypasses RLS via a service-role key that is only used in admin API endpoints. A separate `admin_users` table + JWT claim identifies admins at the application layer; RLS is additive security, not the primary gate.
+
+**The policy design is documented as a spec** in `supabase/migrations/rls-policies.sql` — every table with RLS has its policy enumerated there, with rationale comments. Reviewers can attack policies individually.
+
+### 14.3 Webhook signature verification
+
+Every inbound webhook endpoint verifies signature before touching the database:
+
+- **Stripe**: `stripe-signature` header + `STRIPE_WEBHOOK_SECRET` + the standard Stripe library's `constructEvent` verification.
+- **Whop**: `whop-signature` HMAC with `WHOP_WEBHOOK_SECRET`.
+- **Inngest**: Inngest SDK verifies the signature internally — no custom logic.
+- **Harbor Compliance**: custom HMAC validation.
+
+A forged webhook is rejected *before* any `emit()` call. Rejection logs with `webhook.rejected` event. No event log pollution from malicious input.
+
+Secret rotation: each secret is stored in Supabase Vault (not .env). Rotation is an ops task with a documented procedure. Stripe and Whop support webhook secret rotation with grace periods; we use the grace period to rotate without downtime.
+
+### 14.4 GDPR deletion
+
+When a contact requests GDPR deletion:
+
+1. Admin initiates the deletion workflow via CRM (not exposed to clients directly — verify identity first).
+2. A workflow (Inngest) runs:
+   a. Identify all `sensitive_data` rows for the contact. Delete.
+   b. Null out the `contacts` row's personal fields (name becomes "(deleted)", email becomes null, etc.). Keep the row for referential integrity.
+   c. Emit `contact.gdpr_deleted` event (not `contact.deleted` — the reference still exists).
+   d. Notify any downstream systems (QuickBooks, Stripe, Whop) where the contact may have records.
+3. Events referencing the contact via token still exist; the token now resolves to `(deleted)` when queried. Audit trail is preserved; raw PII is gone.
+
+Document retention policies (per applicable jurisdiction — we follow the more conservative US-state and EU-resident rules):
+- Financial records (invoices, payments): 7 years minimum retention.
+- Contracts and identifying documents: 7 years.
+- Communication history: 3 years default, longer if legally required.
+
+Automatic deletion cron: runs monthly, deletes data past retention thresholds. Soft-deleted first (status='pending_purge'), then hard-deleted after 30-day grace.
+
+### 14.5 Authentication, authorization, sessions
+
+**Authentication**: Supabase Auth. Magic-link or email+password for portal contacts. TOTP 2FA for admins (enforced, not optional).
+
+**Authorization**: admin role checked via JWT claim (`role: 'admin'`) issued by a custom JWT enrichment function at login. Cell-level authz (row-level) is RLS. API-level authz (route handler) checks JWT claim.
+
+**Sessions**: JWT expires in 1 hour; refresh token expires in 30 days. Refresh tokens are rotated on use (each refresh issues a new one, old becomes invalid).
+
+**Password policy**: min 12 characters, complexity rules, breach check via HIBP (optional, config-gated).
+
+**Logout**: invalidates the refresh token server-side; JWTs expire naturally.
+
+### 14.6 Rate limiting and abuse prevention
+
+- **API endpoint rate limiting** via Vercel middleware. Per-IP and per-authenticated-user limits; aggressive on public endpoints (offer signing, chat message post), lenient on authenticated admin endpoints.
+- **Webhook rate limiting** via the outbox drain worker — if a webhook provider is flooding us, the outbox queue grows; monitoring alerts; we can throttle downstream without losing events.
+- **Agent invocation rate limiting** via Inngest concurrency + the cost cap (Section 22). Soft cap at monthly-budget-on-track; hard cap at 100% of budget.
+
+### 14.7 Security rationale and devil's-advocate flags
+
+**[R101-FLAG on PII tokenization overhead.]** Every read of a passport number requires decryption + audit log write. At high volume this is measurable latency.
+
+The resolution: for admin UI reads, decryption is per-view, which is low volume. For agent reads, tokens are not decrypted — agents work with tokens, never raw values. For template generation (signed PDFs, SS-4 forms), decryption is per-document-generation, acceptable batch.
+
+**[R101-FLAG on RLS complexity.]** Deep RLS chains (auth.uid → contact → member → account → engagement → event subject) are expensive and hard to maintain.
+
+The resolution:
+1. Materialized indexes — for portal hot paths, we can add a materialized `portal_engagement_access` view per contact that pre-joins the access chain. Refreshed on membership change.
+2. Policies are tested — every policy has a test case in `tests/rls/` that seeds a user, attempts access, asserts outcome. Policy changes break tests if the intended access model shifts.
+3. Admin bypass is explicit via service-role, not via policy tricks. Service-role usage is audited.
+
+**[R101-FLAG on GDPR deletion completeness.]** Events referencing a deleted contact still exist. If the event payload includes contextual text that names the contact ("Send welcome email to Mario Rossi..."), that text is not a structured PII token — it's free-form and might survive deletion.
+
+The resolution: event payloads are generated with tokens in place of names wherever possible. Free-form text in payloads is scanned for potential PII leakage in a pre-emit validator — if the validator detects name-like patterns in contextual fields, the emit fails with a warning. This is imperfect (detection can miss); the fallback is a GDPR deletion scrubbing pass that replaces detected PII patterns in historical event payloads with tokens. Scheduled, audited.
+
+**[R101-FLAG on Supabase Vault key rotation.]** Encryption keys rotate periodically. All encrypted values must be re-encrypted with new keys.
+
+The resolution: Supabase Vault supports this natively. Rotation is a documented ops procedure: generate new key, re-encrypt all rows (batch job), verify, deprecate old key. Scheduled annually or on suspected compromise.
+
+---
+
+## 15. Claude API and Model Strategy
+
+The AI layer runs on Anthropic's Claude API. Model choice, optimization, and integration pattern are not detail — they directly affect cost, quality, and whether the system delivers on its vision.
+
+### 15.1 Model mix
+
+Expected distribution of API calls across models:
+
+| Model | Share | Use cases |
+|---|---|---|
+| Claude Haiku 4.5 | ~70% | Triage classification, simple requirement checks, routine summaries, bulk categorization, first-draft communication |
+| Claude Sonnet 4.6 | ~25% | Communication drafting (tone matters), solver consults (light reasoning), non-trivial proposal scoring, complex classifications |
+| Claude Opus 4.7 | ~5% | Ambiguous rule interpretation, complex eligibility determinations, cross-engagement reasoning, exception pattern analysis |
+
+Model pricing (Anthropic, 2026):
+- Haiku 4.5: $1 per 1M input tokens / $5 per 1M output tokens
+- Sonnet 4.6: $3 per 1M input tokens / $15 per 1M output tokens
+- Opus 4.7: $5 per 1M input tokens / $25 per 1M output tokens
+
+Model selection is per-task, declared in the agent's dispatch table (`lib/agents/dispatch.ts`). The default for each task type can be overridden per-spec (e.g., a spec's `ai_evaluable` requirement can specify `model: 'opus'`).
+
+### 15.2 Prompt caching
+
+Anthropic's prompt caching discounts cached input tokens by up to 90%. Smart AI applies caching aggressively to the parts of the context bundle that are stable across invocations:
+
+- **System prompt** (agent instructions, R101 reminder, structured-output schema hints): always cached.
+- **Retrieved SOP chunks** where the same chunks appear across invocations: cached for 5+ minutes on first hit.
+- **Applicable rule overrides** (stable for most invocations): cached.
+- **Scar index retrievals** when similar queries return similar results: cached.
+
+**Dynamic content is not cached:**
+- Engagement-specific state.
+- Recent events.
+- Task description.
+- Per-invocation unique context.
+
+Net cost impact: ~60-70% reduction in input token cost. Without caching, 225 clients → ~$3,000/month. With caching, 225 clients → ~$900-1,400/month.
+
+### 15.3 Batch API
+
+Anthropic's Batch API offers a flat 50% discount on all token costs for asynchronous workloads that complete within 24 hours. Smart AI uses Batch API for:
+
+- **Nightly exception pattern analysis** (run weekly, analyze all exceptions from prior week).
+- **Nightly scar-matching recomputation** (run weekly, ensure agent retrieval is current).
+- **Periodic calibration analysis** (monthly, compute AI confidence vs actual accuracy per task type).
+- **Bulk classification backfills** (e.g., when a new service type is added and historical documents need classification against it).
+
+Interactive (synchronous) workloads — agent proposals, real-time chat responses, requirement evaluations during active user sessions — do not use Batch API. They run at full price because latency matters.
+
+### 15.4 Structured outputs
+
+Every Claude invocation uses the Anthropic tool-use API with a strict JSON schema. This constrains the model to produce valid output that the application can deserialize without a parser.
+
+Example for requirement evaluation:
+
+```typescript
+const aiDecisionTool = {
+  name: 'commit_requirement_decision',
+  input_schema: {
+    type: 'object',
+    properties: {
+      decision: { type: 'string', enum: ['eligible','not_eligible','requires_human_review'] },
+      confidence: { type: 'number', minimum: 0, maximum: 1 },
+      reasoning: { type: 'string', minLength: 20 },
+      evidence_cited: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            source_type: { type: 'string', enum: ['sop_chunk','scar','event','document'] },
+            source_id: { type: 'string' },
+            excerpt: { type: 'string' }
+          },
+          required: ['source_type','source_id','excerpt']
+        },
+        minItems: 1
+      },
+      recommendation: { type: 'string' },
+      alternative_considered: { type: 'string', minLength: 20 },
+      weakness_acknowledged: { type: 'string', minLength: 20 }
+    },
+    required: ['decision','confidence','reasoning','evidence_cited','recommendation','alternative_considered','weakness_acknowledged']
+  }
+};
+```
+
+If the model tries to emit output that doesn't match the schema, Anthropic's API rejects the output and the call retries (with guidance). If it consistently fails, the agent escalates to human review.
+
+### 15.5 Response validation post-API
+
+Beyond structured output, every response is validated in application code:
+
+1. **Zod schema validation** (redundant with Anthropic's enforcement but defensive — we catch API regressions and malformed edge cases).
+2. **Semantic validation**:
+   - `source_id` values are checked against the database — if the model invented an ID, fail.
+   - `confidence` is clamped to [0, 1].
+   - `reasoning` length is enforced.
+3. **Scar cross-check**: if the proposal's scar_matches reference scars with preventions that the current state doesn't satisfy, the proposal is flagged for human review regardless of confidence.
+
+### 15.6 Calibration loop
+
+Model confidence is notoriously miscalibrated (reported 0.9 ≠ actual 0.9 accuracy). The calibration loop measures and corrects:
+
+**Data collection:** for each proposal or AI decision, we record:
+- The confidence the model reported.
+- The admin's ultimate disposition (approved / rejected) or the outcome (was the decision correct in retrospect).
+- Task type, model used, context bundle size, scar matches.
+
+**Weekly analysis (Batch API, Opus):**
+- For each (task_type, model) pair, bucket by reported confidence (0-0.5, 0.5-0.7, 0.7-0.85, 0.85-0.95, 0.95-1.0).
+- Compute actual accuracy per bucket.
+- If reported-vs-actual diverge, adjust the auto-execution threshold for that (task_type, model) pair.
+
+**Example outcome:**
+- Task: "Classify inbound email to engagement", Model: Haiku 4.5.
+- Initial auto-route threshold: 0.9 reported confidence.
+- After 4 weeks of data: reports 0.9+ → actual 0.78.
+- Threshold adjusted to 0.95 reported confidence to achieve target 0.95 actual.
+
+This calibration data is stored in `calibration_metrics` table and drives `calibrated_threshold_per_task` config that the agent dispatch reads on every call.
+
+### 15.7 Cost monitoring
+
+Every agent invocation logs its cost to the `ai.decision` or `agent.invoked` event payload:
+
+```typescript
+{
+  model: 'claude-haiku-4.5-20260210',
+  tokens_input: 4200,
+  tokens_input_cached: 3800,
+  tokens_output: 450,
+  cost_usd: 0.0028,
+  cached: true,
+  batch: false
+}
+```
+
+Aggregated via materialized views:
+- Cost per day, by task type.
+- Cost per engagement (attribution).
+- Cost per admin action (if admin-triggered).
+- Cost per client tier (One-Time vs Client vs Partner).
+
+**Monthly cap**: hard ceiling at $4,000 initially. Alert at 80% of monthly projection. At 100%, non-critical agent invocations are throttled (e.g., nightly pattern analyses deferred; routine reminders queued); critical paths (requirement evaluation on active engagement, client-facing chat response) continue.
+
+Raising the cap is Antonio's decision, triggered by observed volume trending past the ceiling.
+
+### 15.8 Model upgrade strategy
+
+New Claude models ship periodically (Anthropic released Opus 4.7 on 2026-04-16, for example). Smart AI's upgrade policy:
+
+1. **Do not upgrade production agents automatically.** Model versions are pinned per task_type in the dispatch table.
+2. **Shadow-test new models** for 2-4 weeks on non-interactive workloads (Batch API analyses, nightly exception pattern detection). Compare output quality and cost.
+3. **Run a calibration rebuild** if the new model's confidence calibration differs materially.
+4. **Gradual rollout**: move easiest task types to the new model first (Triage), measure, then more complex (Communications, Tax). High-risk types (Exception reasoning) are last.
+
+Model versions are part of the `ai.decision` event payload for forensic traceability: if a decision is later challenged, we know which model produced it.
+
+### 15.9 Claude API rationale and devil's-advocate flags
+
+**[R101-FLAG on multi-model complexity.]** Three models, per-task dispatch, calibration per (task, model), cache tuning per model — this is operationally complex.
+
+The resolution: the dispatch table is small and declarative. Calibration is automated weekly. Caching is handled by Anthropic. The complexity is real but bounded by a few config files, not spread across the codebase.
+
+**[R101-FLAG on Anthropic dependency.]** Single vendor. If Anthropic raises prices, changes APIs, or has extended outages, Smart AI is affected directly.
+
+The resolution:
+1. **Abstraction layer**: `lib/agents/llm.ts` wraps Anthropic calls behind a provider-neutral interface. Swapping in OpenAI or another provider is a file-level change, not a system-level change.
+2. **Fallback provider**: at Stage 2+, add OpenAI as a secondary provider. Dispatch can route to it on Anthropic errors or cost spikes.
+3. **Model variety within vendor**: Haiku, Sonnet, Opus are distinct enough that partial-outage resilience exists (if Opus is degraded, fall back to Sonnet for ambiguous reasoning with lower confidence).
+
+**[R101-FLAG on prompt cache TTL.]** Cached content expires. If an invocation happens just after expiry, cost jumps.
+
+The resolution: the cache is a cost optimization, not a correctness feature. Expiry means full-price input tokens; no functional issue. We size the cost budget with cache-miss factored in.
+
+**[R101-FLAG on calibration overfitting.]** With small N (few hundred invocations per task type per week early on), calibration adjustments can overfit to noise.
+
+The resolution: minimum sample size (50 invocations per bucket) before adjusting threshold. Smoothing (Bayesian) rather than point estimates. Initial thresholds are conservative; they loosen as confidence in calibration data grows.
+
+---
+
+## 16. Workflow Engine — Inngest
+
+Inngest is the durable workflow engine for Smart AI. All long-running work, scheduled work, retry-requiring work, and workflow coordination runs here.
+
+### 16.1 Why Inngest (not Temporal, not homemade)
+
+Already detailed in the Architecture Overview (Section 3.4), but the summary:
+
+| Criterion | Inngest | Temporal | Homemade |
+|---|---|---|---|
+| Managed | Yes | Temporal Cloud yes, self-host possible | You operate it |
+| Vercel-native | Yes (SDK, adapter) | No (requires worker tier) | N/A |
+| Ready in | Days | Weeks | Months |
+| LLM-heavy workload fit | Excellent | Payload saturation issues (documented) | Depends on design |
+| Observability built-in | Yes | Needs external wiring | You build it |
+| Cost at Smart AI's scale | $75-300/mo | $200-600/mo+ worker tier cost | "Free" but ops-heavy |
+| Community/maturity | 3+ years, growing | 9+ years, very mature | — |
+
+For Smart AI's workload (~225 clients, hundreds of workflows per day, agent-heavy with large prompts in event payloads), Inngest is the right fit.
+
+### 16.2 Integration pattern
+
+Inngest is integrated via Next.js API route + SDK:
+
+```typescript
+// app/api/inngest/route.ts
+import { serve } from 'inngest/next';
+import { inngest } from '@/lib/inngest/client';
+import * as functions from '@/lib/inngest/functions';
+
+export const { GET, POST, PUT } = serve({
+  client: inngest,
+  functions: Object.values(functions),
+});
+```
+
+Functions are defined as typed step functions:
+
+```typescript
+// lib/inngest/functions/formation-pipeline.ts
+export const formationPipeline = inngest.createFunction(
+  { id: 'formation-pipeline', name: 'Formation Pipeline' },
+  { event: 'engagement.started' },
+  async ({ event, step }) => {
+    const engagementId = event.data.engagement_id;
+
+    await step.run('verify-payment', async () => {
+      const solver = await solve(engagementId);
+      const payment = solver.requirements.find(r => r.key === 'payment');
+      if (payment?.status !== 'satisfied') {
+        throw new Error('Payment not confirmed; formation cannot proceed');
+      }
+    });
+
+    await step.waitForEvent('member-documents-received', {
+      event: 'requirement.satisfied',
+      match: 'data.engagement_id',
+      timeout: '7d',
+      if: `event.data.requirement_key == 'member_passport'`,
+    });
+
+    await step.run('file-with-state', async () => {
+      // Invoke Harbor Compliance or direct state filing
+      // ...
+      await emit({
+        event_type: 'state_filing.submitted',
+        subject_type: 'engagement',
+        subject_id: engagementId,
+        actor_type: 'system',
+        payload: { filed_at: new Date().toISOString(), filing_id: '...' },
+      });
+    });
+
+    // Continue through EIN, OA, etc.
+  }
+);
+```
+
+Each `step.run` is a durable checkpoint — if the function fails mid-execution, it resumes from the last completed step on retry. Each `step.waitForEvent` blocks execution until the event arrives or timeout hits. The engine handles persistence, retry, and coordination.
+
+### 16.3 Event-triggered workflows
+
+Smart AI uses Inngest's event-driven pattern. Events from the outbox drain trigger workflows matched by name + filters:
+
+- `engagement.started` → `formationPipeline` (if contract_type='formation'), `onboardingPipeline` (if 'onboarding'), `taxIntakePipeline` (if 'tax').
+- `payment.confirmed` → `paymentConfirmedHandler` (activates services, triggers notifications).
+- `document.uploaded` → `documentProcessingWorkflow` (classify, extract, satisfy requirements).
+- `requirement.satisfied` → `agentTriggerWorkflow` (decide if agent should act on the updated state).
+
+Each workflow is narrow and testable. Composition happens via event chaining, not nested calls.
+
+### 16.4 Scheduled workflows
+
+Cron-triggered functions for periodic work:
+
+- **`outboxDrain`** — every 10 seconds (also triggered by Realtime on insert).
+- **`exceptionExpirer`** — daily at 00:30 UTC.
+- **`reminderCadenceRunner`** — daily at 14:00 UTC (per-client timezone adjusted).
+- **`calibrationAnalyzer`** — weekly Sunday 02:00 UTC (uses Batch API).
+- **`scarReembedder`** — daily at 03:00 UTC (refreshes pgvector embeddings if scar content changed).
+- **`sopReembedder`** — daily at 03:30 UTC (reads v1 sop_runbooks, chunks, embeds).
+- **`shadowDiffSampler`** — hourly (reads v1 webhooks, tees into v2 shadow mode).
+- **`dailyDigest`** — daily at 08:00 Antonio's timezone (summarizes new proposals, unresolved items).
+
+All scheduled functions use Inngest's cron expressions plus concurrency limits to prevent overlapping executions.
+
+### 16.5 Retry and failure handling
+
+Inngest handles retries automatically with configurable policies:
+
+- **Default retry**: exponential backoff, 3 retries, max 10 minutes between attempts.
+- **Custom retry** per function for cases requiring different behavior (e.g., external API with known flaky periods → more retries with longer backoff).
+- **Step-level granularity**: a failing step retries independently of the rest of the function.
+- **Dead letter queue**: after max retries, the function is marked `failed`. Inngest dashboard shows failures; alerts fire.
+- **Manual replay**: failed functions can be replayed from the dashboard or via API.
+
+### 16.6 Observability within Inngest
+
+- **Run history**: every function execution is logged with input, output per step, timing.
+- **Cost attribution**: Inngest dashboard shows execution count per function; we map this to our own cost model.
+- **Alerts**: email/Slack on failure after N retries, or on cron drift.
+
+Augmented in Smart AI's own observability (Section 18): Inngest run IDs are logged in `ai.decision` / `agent.invoked` events, creating cross-reference between Inngest history and Smart AI's event log.
+
+### 16.7 Inngest rationale and devil's-advocate flags
+
+**[R101-FLAG on vendor dependency.]** Inngest is 3 years old. If it folds or degrades, we're affected.
+
+The resolution:
+1. The workflow functions are plain TypeScript. Migration to Temporal, Trigger.dev, or a homemade queue is a wrapper-layer change, not a business-logic rewrite.
+2. Inngest has VC backing and growing adoption. Near-term vendor risk is low.
+3. If we outgrow Vercel + Inngest, Temporal becomes viable — we'll have validated workflow logic to port.
+
+**[R101-FLAG on pricing scale.]** Inngest's Pro tier starts at $75/mo with execution-based billing. At high event volume (1,000 clients with 100 events/day), executions can rack up.
+
+The resolution: cost at 1,000 clients is estimated at $300/mo Inngest. Proactive monitoring catches cost overruns before they're material. Critical workflows always run; non-critical batch operations can be deferred if hitting limits.
+
+**[R101-FLAG on cold starts.]** Inngest functions run on serverless infrastructure. Cold starts can add latency.
+
+The resolution: for time-sensitive workflows (chat responses, auth checks), cold starts are a concern. Solutions: dedicated Vercel instances for hot paths, or move interactive latency-sensitive workflows out of Inngest entirely and into direct API routes. Most of Smart AI's Inngest usage is async (outbox drain, formation pipeline, scheduled jobs) where a 100ms cold start is invisible.
+
+---
+
+---
+
+## 17. Infrastructure and Environments
+
+Smart AI TD Operations runs on the same providers as v1 plus Inngest. Every piece of infrastructure is named, isolated, and accounted for here. Nothing is assumed; every reference below is something a reviewer can look up directly.
+
+### 17.1 Environment topology
+
+Three distinct environments exist across v1 and Smart AI. They never share env vars, database connections, webhook destinations, or domains.
+
+**v1 Production**
+- Supabase ref: `ydzipybqeebtpcvsbtvs`
+- Vercel project: `td-operations` (production)
+- Domains: `app.tonydurante.us` (client-facing), `portal.tonydurante.us` (portal), `td-operations.vercel.app` (internal OAuth issuer / CRM admin), `offerte.tonydurante.us` (legacy offer links)
+- Purpose: serves the existing 253 Active accounts and all in-flight engagements.
+- Owner: v1 CLAUDE.md.
+
+**v1 Sandbox**
+- Supabase ref: `xjcxlmlpeywtwkhstjlw`
+- Vercel project: `td-operations-sandbox`
+- URL: `td-operations-sandbox.vercel.app`
+- Purpose: v1 feature testing, QA, destructive-test-friendly. Antonio and Luca validate v1 changes here before production deploy.
+- Owner: v1 CLAUDE.md (section: Sandbox Environment).
+
+**Smart AI (v2)**
+- Supabase ref: `tapbgvbglqacamhayfel` (verified alive via REST probe 2026-04-21 at 23:30 UTC; owner confirmed by Antonio)
+- Vercel project: `td-operations-v2` (to be created at Stage 0 S0.1)
+- Domain: `v2.tonydurante.us` (to be provisioned at Stage 0 S0.1)
+- Purpose: greenfield rebuild. Shadow-consumes v1 webhooks read-only; at cutover, new clients land here.
+- Owner: this plan + Smart AI CLAUDE.md.
+
+**Cross-environment rules:**
+- No env var from one environment appears in another.
+- No webhook destination of one environment is registered with any provider in the context of another.
+- `EXPECTED_SUPABASE_REF` middleware assertion in each environment refuses to boot if the connected Supabase ref doesn't match the expected value. Fatal error on mismatch.
+- Domains are fully separated. `v2.tonydurante.us` never resolves to the v1 production Vercel project.
+
+### 17.2 Supabase (data, auth, realtime, storage)
+
+**Usage by layer:**
+- **Data** — Postgres with pgvector extension. All core tables (`accounts`, `contacts`, `account_members`, `engagements`, `events`, `outbox`, `sensitive_data`, `service_specs`, `rule_overrides`, `exceptions`, `proposals`, `ai_decisions`, `v1_scars`, `shadow_diffs`, etc.).
+- **Auth** — Supabase Auth for portal contacts (magic link + password); admin auth via the same but with TOTP 2FA required.
+- **Realtime** — channel subscriptions for portal page live updates (event-scoped channels).
+- **Storage** — client documents go here (NOT Google Drive for v2 at first cutover; see "Storage strategy" below).
+- **Edge Functions** — used for webhook receivers (Stripe, Whop, Inngest signature verification entry points), specifically so webhook verification runs close to Postgres with low latency.
+- **Vault** — secrets (webhook signing keys, encryption keys). Not in env vars beyond bootstrap.
+
+**Storage strategy for v2:**
+- v1 uses Google Drive Shared Drive (`0AOLZHXSfKUMHUk9PVA`) for client documents. That setup stays for v1.
+- For Smart AI, we start with Supabase Storage as the document repository (first cutover). Supabase Storage is S3-compatible, has direct RLS integration, is cheaper to operate (no Drive service account / DWD configuration), and is simpler to audit.
+- Drive integration becomes a Stage 2+ add-on if document-sharing workflows with non-portal parties (accountants, legal counsel) require it. Not Stage 1 scope.
+
+**Postgres extensions to enable on Smart AI ref:**
+- `uuid-ossp` or `pgcrypto` (for `gen_random_uuid`, already standard).
+- `pgvector` (for embeddings, retrieval).
+- `pg_cron` (optional; most scheduling via Inngest).
+- `pg_net` (optional; HTTP calls from functions).
+
+### 17.3 Vercel (hosting, edge, domain, env management)
+
+**Vercel projects:**
+- `td-operations` — v1 production, existing, untouched.
+- `td-operations-sandbox` — v1 sandbox, existing, untouched.
+- `td-operations-v2` — Smart AI, **to be created at Stage 0 S0.1**.
+
+**Project configuration for `td-operations-v2`:**
+- Framework: Next.js 14+ (same as v1).
+- Region: primary US East (co-located with Supabase Smart AI region for low latency).
+- Build command: `npm run build` (Next.js default + type checking).
+- Output: server-rendered + edge middleware.
+- Deployment: Git-connected to `TonyDuranteSystem/td-operations-smart-ai` → auto-deploy on push to `main`.
+- Preview deployments: per-branch for PR review.
+
+**Required environment variables (Smart AI project):**
+- `NEXT_PUBLIC_SUPABASE_URL` — Smart AI Supabase REST URL.
+- `NEXT_PUBLIC_SUPABASE_ANON_KEY` — Smart AI anon key.
+- `SUPABASE_SERVICE_ROLE_KEY` — Smart AI service role key (admin API paths only).
+- `EXPECTED_SUPABASE_REF` — `tapbgvbglqacamhayfel` (middleware trip wire).
+- `ANTHROPIC_API_KEY` — Claude API key (separate from v1's key; attribution clean).
+- `INNGEST_EVENT_KEY` — Inngest event ingestion key.
+- `INNGEST_SIGNING_KEY` — Inngest webhook signature verification.
+- `STRIPE_SECRET_KEY` / `STRIPE_WEBHOOK_SECRET` — only when we wire Stripe to v2 (post Stage 1).
+- `WHOP_API_KEY` / `WHOP_WEBHOOK_SECRET` — same.
+- `OPENAI_API_KEY` — for embeddings only (until Anthropic embeddings GA).
+- `SENTRY_DSN` — error tracking.
+
+**Vercel 60-second timeout:** mitigated by offloading all long work to Inngest. API routes that might exceed 60s instead emit an event and let Inngest handle the actual work.
+
+**Middleware:**
+- `middleware.ts` at project root.
+- Asserts `EXPECTED_SUPABASE_REF` vs connected ref on cold start; 500s if mismatched.
+- Enforces auth on portal and admin paths.
+- Blocks webhook routes if `SANDBOX_MODE=1` is set (safety).
+- Blocks any reference to v1 Supabase URL (regex check on config); fatal.
+
+### 17.4 Inngest (workflow engine)
+
+**Inngest account setup:**
+- Create a new Inngest organization (or use existing if Antonio has one).
+- Create a new app within the org: `td-operations-v2`.
+- Link to the Vercel project via the Vercel + Inngest integration (one-click).
+- Generate event key and signing key; inject as env vars.
+- Configure notification channel (email or Slack) for function failures.
+
+**Pricing tier:** start at Pro ($75/mo). Monitor usage; upgrade if needed. Expected usage 50k-200k executions/month at 225-500 clients, well within Pro limits.
+
+### 17.5 Anthropic (Claude API)
+
+**Account:**
+- Use Antonio's Anthropic org. Create a new project within the org: "Smart AI TD Operations".
+- Issue a separate API key for this project (separates billing from any other workloads on the org).
+- Set workspace-level spend limits if the Anthropic console supports them (it does as of 2026).
+
+**Prompt caching:** automatic via the API (no setup needed beyond passing `cache_control` parameters on cached sections of the prompt). Monitor cache hit rate via the response headers + dashboard.
+
+**Batch API:** opt-in per call. Agent dispatch marks tasks eligible for batching (nightly analyses); interactive tasks stay real-time.
+
+### 17.6 OpenAI (embeddings only, interim)
+
+**Why OpenAI embeddings, not Anthropic:**
+- As of plan-write date, Anthropic's embeddings API is in beta/limited. OpenAI's `text-embedding-3-small` (1536 dim, $0.02 per 1M tokens) is stable, cheap, sufficient.
+- pgvector stores the embeddings; we're not locked into the provider — we can re-embed if Anthropic ships GA embeddings later.
+- Embedding cost is negligible (<$5/mo at 225 clients even with daily re-embeds).
+
+**Migration path:** when Anthropic ships embeddings GA with comparable cost/quality, add a flag in the embedding helper to switch providers. Re-embed existing pgvector rows in a Batch API job. No application code changes.
+
+### 17.7 GitHub repository
+
+**Repo:** `TonyDuranteSystem/td-operations-smart-ai`
+- Created: 2026-04-21 (commit `baa4c5e`).
+- Visibility: private.
+- Branch protection on `main`: require PR, require passing CI, require at least one approving review (future — currently Antonio approves in the conversation).
+- Husky pre-commit hooks: lint-staged runs ESLint on staged TS/TSX.
+- Husky pre-push hooks: remote-sync check, hardcoded-domain check, ESLint on changed files vs origin/main, unit tests (Vitest), full `next build`.
+
+**Directory structure (bootstrapped):**
+- `lib/specs/` — TypeScript spec authoring
+- `lib/agents/` — agent dispatch, tools, context builder
+- `lib/policies/` — rule functions (named TS code rules)
+- `lib/scars/` — scar extraction scripts and seed helpers
+- `lib/events/` — emit(), event type definitions, Zod schemas
+- `lib/solver/` — solver logic
+- `lib/inngest/` — Inngest functions
+- `app/` — Next.js routes (portal, CRM, admin, API)
+- `tests/unit/` — unit tests
+- `tests/integration/` — integration tests
+- `supabase/migrations/` — SQL migrations
+- `docs/` — this plan, ADRs, operational runbooks
+
+### 17.8 MCP server (for Claude Code development)
+
+**v1 MCP:** `af7d85f2-3684-4443-8eac-bb32d00e32be` — 206 tools, all pointing at v1 Supabase production. Stays pointed at v1 for v1 development.
+
+**Smart AI MCP (to be created):**
+- Clone of v1 MCP codebase (same repo or a new one; decided at Stage 0 S0.1).
+- Repointed at Smart AI Supabase (`tapbgvbglqacamhayfel`).
+- Tool surface trimmed to greenfield-only tools:
+  - `execute_sql` (scoped to Smart AI DB)
+  - `session_checkpoint` (against Smart AI's own session_checkpoints table)
+  - `sysdoc_*` (Smart AI's own sysdocs, or a thin adapter to v1 sysdocs during the build period)
+  - `dev_task_*` (Smart AI's own dev_tasks table post-Stage 0; for now, dev_tasks live in v1 sysdocs for single-read-surface convenience)
+  - New Smart AI-specific tools: `event_inspector`, `scar_search`, `scar_create`, `proposal_inspector`, `spec_editor_dryrun`.
+- Bearer-token + OAuth 2.1 dual auth (same pattern as v1).
+
+Until the Smart AI MCP is up (Stage 0 S0.1 completes), Claude Code development sessions on the Smart AI repo use the v1 MCP for cross-reference queries (reading v1 sop_runbooks for scar population, querying v1 data for panel verification) but not for Smart AI writes. Smart AI writes happen via direct Supabase admin client in code or via Supabase CLI for migrations.
+
+### 17.9 Claude Code (development tool)
+
+The system is built by Claude Code (Opus 4.7, 1M context) running locally on Antonio's MacBook. Session discipline (Section 21) governs how Claude operates.
+
+**Per-session setup:**
+- Read `sysdoc_read('smart-ai-td-ops-architecture')` — this plan + decision record.
+- Read `sysdoc_read('smart-ai-td-ops-stage-0-worklist')` — current stage worklist.
+- `git pull origin main` — sync with other machines (if any are working on Smart AI; MacBook is lead but others may eventually contribute).
+- Confirm which Supabase ref is being operated against.
+
+**Not in scope:** Claude.ai sessions (web-based) work for *reviewing* the plan and *challenging* it (Section 21.4 — multi-session challenge protocol), but *building* is done in Claude Code with MCP tools. Web sessions do not have the tool surface to commit code.
+
+### 17.10 Monitoring and error tracking
+
+- **Sentry** — error tracking (client-side, server-side, edge). Same pattern as v1 (R060 mentions it). Separate Sentry project for Smart AI; separate DSN.
+- **Inngest dashboard** — workflow run history, failures, alerts.
+- **Supabase dashboard** — DB queries, performance, connection usage.
+- **Vercel dashboard** — deployment status, analytics, function invocations, cold start metrics.
+- **Custom observability sysdocs and dashboards** — see Section 18.
+
+### 17.11 Infrastructure rationale and devil's-advocate flags
+
+**[R101-FLAG on Supabase as single data vendor.]** All data is in Supabase. A Supabase outage affects the entire system. Pro tier SLA is 99.9% (about 8.7 hours downtime/year).
+
+The resolution:
+1. Accept this. Multi-vendor data is complex, and at Antonio's scale the operational overhead isn't justified.
+2. Backups: Supabase provides point-in-time recovery (PITR) on Pro+ plans. Test restore procedure documented; practiced quarterly.
+3. Read replica for analytics (Stage 2+) reduces load on primary.
+
+**[R101-FLAG on Vercel 60s timeout still biting somewhere.]** Most long work goes to Inngest, but some paths (document upload with inline virus scan, large file processing, synchronous OAuth flows) might hit the limit.
+
+The resolution: explicit time budget per path. If any path approaches 30s in testing, it's refactored to the Inngest pattern (emit event, return immediately, let Inngest complete the work async, poll or WebSocket the client for status).
+
+**[R101-FLAG on multi-provider billing coordination.]** Vercel, Supabase, Inngest, Anthropic, OpenAI, Sentry — five billing relationships. Cost tracking across them is manual.
+
+The resolution: a single "Smart AI cost dashboard" sysdoc (and eventually a CRM page) aggregates monthly spend per provider. Antonio reviews monthly. Individual bills stay with each provider; the dashboard is summary.
+
+**[R101-FLAG on the MCP server being stood up before Stage 0 S0.2 schema.]** The MCP server points at the Smart AI Supabase, but the Smart AI tables don't exist yet at the start of Stage 0. The MCP's tool schemas assume certain tables.
+
+The resolution: MCP tools are parameterized by schema introspection at start-up. If a table doesn't exist, the relevant tool returns a clear "not yet available" error rather than crashing. The MCP works progressively as tables come online during Stage 0.
+
+---
+
+## 18. Observability
+
+Observability is not optional. It is built into Stage 0 before the first `emit()` call, because the system cannot be operated safely without it. Without observability, silent failures become invisible failures become business incidents.
+
+### 18.1 SLOs
+
+Service-level objectives for first cutover:
+
+| Surface | SLO | Measurement |
+|---|---|---|
+| Portal page load (p95) | < 1.5 seconds | Vercel analytics + custom timing |
+| CRM client-360 load (p95) | < 2.5 seconds | same |
+| Solver `solve()` call (p95) | < 500ms with cache hit, < 2s cache miss | custom timing in emit of `agent.invoked` |
+| `emit()` call (p95) | < 100ms | custom |
+| Outbox drain lag (p95) | < 10 seconds from `emit()` to `published` | drain worker telemetry |
+| Agent invocation (p95) | < 3 seconds | `ai.decision.duration_ms` |
+| Webhook signature verification | < 50ms | webhook endpoint timing |
+| Availability (per endpoint class) | 99.5% first 90 days, 99.8% after stabilization | Sentry + Vercel + synthetic checks |
+
+SLO dashboards surface these weekly. Breaches are investigated per-incident with root-cause analysis added to the scar index.
+
+### 18.2 Metrics taxonomy
+
+Four metric families:
+
+**Business metrics** (feed the Intelligence-First Dashboard in CRM):
+- Engagement count by status.
+- Requirement-satisfaction distribution per spec.
+- Time-to-satisfy per requirement type (median, p95).
+- Exception rate per requirement.
+- Agent approval rate per proposal type.
+- Cost per engagement (compute + agent + infrastructure).
+
+**Operational metrics** (feed admin dashboards):
+- `emit()` rate (events/sec, events/minute).
+- Outbox depth (pending count).
+- Drain worker latency.
+- Inngest function run counts per function.
+- Inngest failure rate per function.
+- Realtime connection count.
+
+**AI metrics** (feed calibration + cost dashboards):
+- Agent invocations per task type.
+- Tokens in / out per model per task type.
+- Cache hit rate.
+- Batch API usage.
+- Calibration curves (reported confidence vs actual accuracy, per task type and model).
+- Hallucination flag rate (structured output validation failures).
+
+**Infrastructure metrics**:
+- Vercel function invocation counts + durations.
+- Supabase connection pool utilization.
+- Postgres slow query log.
+- pgvector query latency.
+
+### 18.3 Shadow mode
+
+Shadow mode is the mechanism by which we validate v2 against v1's production traffic without any client-facing effect.
+
+**Setup (Stage 0 S0.7):**
+- A read-only tap on v1 production webhooks (Stripe, Whop, etc.) tees the webhook payload into Smart AI's event log as `subject_type='v1_shadow'`.
+- Smart AI's solver runs on the shadow events — computes what its requirements would show — and logs the output to `shadow_diffs`.
+- v1's actual current state for the same subject is queried (via the shared `knowledge_articles` access to v1 Supabase, or a scheduled poll).
+- Diff recorded: Smart AI's status vs v1's status per requirement.
+
+**Shadow metrics:**
+- Diff rate per spec (how often v2 differs from v1's current state).
+- Diff category breakdown (spec bug, import bug, v1 data issue, expected difference).
+- Evolution over time — as we fix diff causes, the rate should trend down.
+
+**Shadow mode dashboards** surface diffs per account for investigation. This is how we grind out confidence before cutover. Stage 0 S0.8 (30-client verification panel) is the explicit exit gate for shadow-mode diff.
+
+### 18.4 Alerting
+
+Alerts fire on specific conditions with structured escalation:
+
+**Critical (page immediately):**
+- Any endpoint returning 500s at > 1% rate for > 5 minutes.
+- Outbox depth > 1,000 for > 5 minutes.
+- Calibration curve regression > 20% (model quality collapsed).
+- Webhook signature failures > 10 in 10 minutes (possible attack).
+- `EXPECTED_SUPABASE_REF` mismatch (boot failure).
+- Cost projection exceeds monthly cap.
+
+**Warning (email daily digest):**
+- p95 slower than SLO for any surface for 24 hours.
+- Agent proposal rejection rate > 30% for any task type (calibration drift).
+- Scar index pattern match fires on > 5 proposals in 24 hours (possible systemic issue).
+- Sentry error rate spike.
+
+**Info (weekly digest):**
+- Cost week-over-week change > 10%.
+- New exception pattern detected.
+- Calibration adjustment made.
+- Feature usage summary.
+
+Alerts route to Antonio's email / Slack. Non-critical alerts batch into daily / weekly digests to avoid alert fatigue.
+
+### 18.5 Audit trail
+
+Separate from metrics but critical: every action is auditable.
+
+- **Event log** — every state change.
+- **`action_log`** (new table, separate from events) — API-level audit: which admin made which call at what time, with what payload.
+- **`agent.invoked` events** — every agent call.
+- **Sentry breadcrumbs** — error context.
+
+Audit retention: 7 years minimum (matches US financial-records retention).
+
+### 18.6 Observability rationale and devil's-advocate flags
+
+**[R101-FLAG on observability cost.]** Telemetry infrastructure (Sentry, custom metrics, dashboards) has a cost. Some dashboards may not be used after initial build.
+
+The resolution: minimum viable observability first (Sentry + the weekly dashboard of key metrics). Build additional dashboards reactively — when a question is asked and the answer isn't easy, that's a dashboard candidate. Don't build 30 dashboards speculatively.
+
+**[R101-FLAG on SLO calibration early on.]** The SLOs above are targets for cutover. During Stage 0 and shadow mode, we don't have production traffic; SLO compliance is hypothetical.
+
+The resolution: Stage 0 uses synthetic load tests (scripted requests with a fixed pattern) to validate SLOs. Shadow mode uses real v1 traffic shape. Both approaches give early signal without risk. Post-cutover, real traffic sets real SLOs and we adjust targets if the first-draft numbers were wrong.
+
+**[R101-FLAG on alert fatigue.]** Too many alerts and nobody reads them. Not enough alerts and incidents are invisible.
+
+The resolution: the three tiers above (critical / warning / info) plus a strict rule — Critical alerts are pageable; Warning and Info are never paged. Every Critical alert that fires and is dismissed without action triggers a review: was this a false positive? If yes, tune the threshold. This keeps the Critical channel trusted.
+
+---
+
+## 19. Build Stages
+
+The full build is divided into stages, each with a clear entry condition, exit criteria, and deliverable. Stage 0 is detailed; Stages 1-7 are outlined; the plan will expand a stage only when the prior exits.
+
+### 19.1 Stage 0 — Foundation
+
+**Goal:** build the infrastructure, schema, and learning substrate every later stage depends on.
+
+**Duration:** 3-4 weeks (2026-04-21 → ~2026-05-19).
+
+**Worklist** (see `sysdoc_read('smart-ai-td-ops-stage-0-worklist')` for the live-maintained version):
+
+- **S0.0 — Repo + environment isolation.** Create GitHub repo, clone to MacBook, bootstrap CLAUDE.md + directory skeleton, configure new MCP server. (Partially complete; MCP server blocked on S0.1 Supabase ref.)
+- **S0.1 — Confirm infrastructure.** Verify Supabase ref, create Vercel project, create Inngest account, set env vars, provision staging domain, commit isolation middleware.
+- **S0.2 — Core schema.** Apply all Stage 0 tables (entity graph, event log, outbox, sensitive_data, service_specs, rule_overrides, exceptions, proposals, ai_decisions, v1_scars, shadow_diffs) plus RLS policies to Smart AI Supabase.
+- **S0.3 — emit() + outbox mechanism.** Ship `emit(event)` Postgres function + TypeScript wrapper, outbox drain worker (Inngest scheduled + Realtime-triggered), first event types implemented, unit tests (atomicity, idempotency, drain backlog handling).
+- **S0.4 — First spec: SMLLC Formation.** Author in TypeScript, strict schema, seeded to `service_specs`, unit tests using fixture event lists.
+- **S0.5 — Solver skeleton.** Pure function, deterministic, no DB writes, cache layer, unit tests with v1-anonymized fixtures.
+- **S0.6 — Event inspector admin page.** `/admin/events` with browse/search/filter/chain-tree, not client-visible.
+- **S0.7 — Shadow-mode infrastructure.** Read-only tap on v1 webhooks, shadow solver runs, shadow_diffs table + dashboard.
+- **S0.8 — Verification milestone: import + diff (exit gate).** All 30 panel clients imported from v1 (see Appendix B). Solver run against all. Diffs triaged by root cause. Zero-or-explained diff across unique root causes.
+- **S0.9 — v1 Scar Index population (exit gate companion).** ≥50 scars extracted from CLAUDE.md R005-R101 + v1 bugfix dev_tasks + planning docs. Each with category, root cause, Smart AI prevention, verification path. Embeddings generated. Agent retrieval wired (for Stage 1).
+
+**Exit criteria:**
+- Full 30-client panel imported, solver diff clean or documented.
+- ≥50 scars in `v1_scars` with preventions.
+- All Stage 0 tasks complete or explicitly deferred with rationale.
+- Architecture sysdoc re-read and reaffirmed by Antonio.
+
+**What Stage 0 does NOT produce:**
+- No Ops Agent (Stage 1).
+- No portal or CRM beyond admin event inspector.
+- No spec beyond SMLLC Formation.
+- No payment integration.
+- No cutover.
+
+### 19.2 Stage 1 — First Complete Flow: MMLLC Formation
+
+**Goal:** prove the entire architecture on a real service end-to-end, with MMLLC Formation as the pilot (picked for variety — per-member requirements surface more edge cases than SMLLC).
+
+**Duration:** 3-4 weeks (~2026-05-19 → ~2026-06-16).
+
+**Deliverables:**
+- **MMLLC Formation spec** authored in TypeScript, seeded to `service_specs`.
+- **Solver handles all formation requirements** including per-member documents, signer designation, cross-state variations.
+- **Portal v2 pages for formation:** adaptive dashboard driven by solver, dynamic members step in wizard, per-member document upload, unified timeline.
+- **CRM v2 client 360:** solver-driven checklist, member management UI, exception handling UI, AI Context Panel.
+- **Ops Agent v1 launch:** single agent, core tools, context bundle, scar retrieval, proposal inbox. Initial supported task types: `evaluate_requirement`, `generate_proposal` (reminder emails), `draft_communication`.
+- **Inngest workflows:** formation pipeline (payment → member documents → state filing → EIN → OA).
+- **Payment integration:** Stripe webhooks → `payment.confirmed` events. Invoice generation with version-pinned pricing.
+- **Verification:** run 5 real MMLLC formations through v2 in shadow mode for 2 weeks. Compare with v1 production outcomes.
+
+**Exit criteria:**
+- End-to-end MMLLC formation runs without admin intervention on happy path.
+- Exception handling demonstrated for at least 3 real edge cases.
+- Agent proposals generated at least 10, reviewed by Antonio, approval rate recorded.
+- Shadow diff vs v1 for 5 test formations is clean.
+
+### 19.3 Stage 2 — Expand Service Types
+
+**Goal:** add specs for remaining in-cutover-scope service types, validating each in shadow mode before cutover.
+
+**Duration:** 4-6 weeks (~2026-06-16 → ~2026-07-28).
+
+**Deliverables** (in order; each validated before moving to next):
+- SMLLC Formation (adapted from Stage 1 generalizations; simpler variant).
+- Client Onboarding (wizard auto-generates account, OA + Lease templates).
+- Tax Return intake + routing (not full India filing handoff — intake only).
+- Payment handling hardened: Whop webhook, wire transfer (manual entry), currency conversion, refunds, disputes.
+- Ops Agent task types added: `evaluate_requirement` for tax-evaluable rules, complex classification for inbound documents.
+- CRM proposal inbox batch operations.
+- Spec editor Values tab production-ready (not just MVP).
+
+**Exit criteria:**
+- Each service type passes shadow-mode validation on ≥3 real engagement imports.
+- Agent approval rates by task type meet or exceed initial targets (80%+ for reminders, 90%+ for classifications).
+- No P0/P1 incidents in 2 weeks of shadow operation.
+
+### 19.4 Stage 3 — Payment Unification + Invoice Hardening
+
+**Goal:** one payment event flow, one handler, all methods. Invoice generation hardened for production.
+
+**Duration:** 2-3 weeks (~2026-07-28 → ~2026-08-18).
+
+**Deliverables:**
+- Unified `MoneyMovement` entity (payment + refund + dispute treated uniformly).
+- All payment sources → `payment.confirmed` / `payment.failed` / `payment.refunded` / `payment.disputed` events.
+- Installment schedule driven entirely by rules, not hardcoded in handlers.
+- Invoice-number generator with R098 semantics preserved (DB unique + retry on conflict).
+- QB integration: manual-only push button in CRM (R097 preserved). No automatic QB sync anywhere.
+- Invoice PDFs generated from templates (first version; basic layout).
+
+**Exit criteria:**
+- 20 payment events (across methods) flow correctly through v2 in shadow mode.
+- QB sync tested on 5 sandbox invoices.
+- No PII in payment event payloads (tokens only).
+
+### 19.5 Stage 4 — AI Layer Expansion + Auto-Approval
+
+**Goal:** move from "agent proposes, human reviews all" to "agent proposes, human reviews where it matters, internal-only actions auto-execute."
+
+**Duration:** 3 weeks (~2026-08-18 → ~2026-09-08).
+
+**Deliverables:**
+- Blast-radius-gated auto-execution for internal_only proposals.
+- Calibration loop in production (weekly analysis, threshold adjustments).
+- Proposal approval thresholds tuned per task type per model.
+- Scar-match-as-veto: any proposal matching a scar with unsatisfied prevention requires human review.
+- Communication drafting Phase 2: drafts scored for tone/accuracy, admin can edit inline before send.
+- Multi-model tiering fully enabled (Haiku/Sonnet/Opus dispatch).
+
+**Exit criteria:**
+- Auto-execution rate for internal_only proposals: 30-50% (conservative start).
+- Client-facing proposals: 100% human-reviewed. No exception.
+- Calibration dashboards show convergence (actual accuracy ≈ reported confidence within ±5%).
+
+### 19.6 Stage 5 — Unified Communications + Inbox
+
+**Goal:** one timeline per client, all channels. Unified inbox in CRM.
+
+**Duration:** 2-3 weeks (~2026-09-08 → ~2026-09-29).
+
+**Deliverables:**
+- Communication entity unifying email (inbound + outbound), portal chat, notifications.
+- AI-powered message classification on inbound email (routing to engagements).
+- Unified inbox in CRM: priority-ordered, filtered, searchable.
+- Portal chat integrated with event log (R100 preserved — soft-delete on chat messages).
+- Ops Agent task type: Portal-Support (draft responses to client chat; Antonio/Luca approve).
+
+**Exit criteria:**
+- Inbound email classification accuracy ≥ 90%.
+- Portal chat response time (admin-approved) ≤ 2 hours during business hours.
+- Unified timeline renders cleanly across 10 complex (multi-engagement) accounts.
+
+### 19.7 Stage 6 — Rules Editor + Exception Patterns + Spec Editor Structure Tab
+
+**Goal:** close the loop. The system learns from how it's used; Antonio edits what he needs without developer involvement.
+
+**Duration:** 2 weeks (~2026-09-29 → ~2026-10-13).
+
+**Deliverables:**
+- Spec Editor Values tab: production-ready with preview dry-run.
+- Spec Editor Structure tab: read-only view + "propose structural change" → dev_task.
+- Pricing rules editor with version pinning honored.
+- Exception pattern detection + banner in Spec Editor.
+- Rule change events surfacing in audit timeline.
+- Documentation for Antonio on how to edit rules (sysdoc).
+
+**Exit criteria:**
+- Antonio edits at least 3 rule values during this stage to validate the flow.
+- No unintended production changes from the edits.
+- Exception pattern detection fires at least once (natural or simulated).
+
+### 19.8 Stage 7 — Production Cutover Preparation and Go-Live
+
+**Goal:** move from sandbox to production. First new client lands on v2.
+
+**Duration:** 1 week ramp + go-live (~2026-10-13 → 2026-10-21).
+
+**Deliverables:**
+- Final shadow-mode run on all 30 panel clients for 1 week, zero diff required.
+- Cutover runbook: exact sequence of DNS changes, webhook re-registration, environment variable updates.
+- Rollback plan: if issues surface within 72 hours post-cutover, how to route new client to v1 temporarily while we fix v2.
+- Communication plan: new clients onboarding after cutover get v2; existing clients stay on v1; no client confusion.
+- Post-cutover monitoring: hourly check for first 72 hours, then daily for 30 days.
+
+**Exit criteria:**
+- 2026-10-21: first new client's payment → engagement → portal → wizard → formation completes on v2 with no admin intervention on happy path.
+- Monitoring dashboards green for 72 hours post-cutover.
+- Scar index expanded with any post-cutover lessons.
+
+### 19.9 Post-cutover (Stages 8+): feature-by-feature migration
+
+Detailed separately — see Section 20.
+
+---
+
+## 20. Migration Strategy
+
+Migration is where greenfield rewrites die. This section is intentionally explicit. No cutover is a "flip the switch" event; it's a staged process with rollback capability at every step.
+
+### 20.1 Pre-cutover: shadow mode (Stages 0-7)
+
+Shadow mode runs throughout Stages 0-7. Key pieces:
+
+- **Read-only tap on v1 production webhooks.** Stripe, Whop, Inngest (once added on v1 side, which won't happen — v1 stays as is), and any other inbound webhook sources are configured with a secondary URL: Smart AI's shadow endpoint. Smart AI validates signatures, receives payloads, tees into the shadow event log with `subject_type='v1_shadow'`.
+- **Imported v1 engagements.** For the 30 panel clients (Appendix B), we import their current v1 state into Smart AI: contacts, accounts, members, documents, payments, service deliveries. We synthesize events (since v1 didn't record them event-first) by reading current state and producing a reasonable historical event chain.
+- **Solver runs.** For each imported engagement, the Smart AI solver runs and produces a `StatusReport`. Cached + served to `shadow_diffs`.
+- **Periodic diff.** A scheduled job reads v1's current state for the same engagement (via read-only replica or polling) and diffs against Smart AI's solver output. Diff rows go to `shadow_diffs`.
+- **Dashboard.** Displays diff counts per spec, per root cause. Trends over time. The target is diff count → 0 or fully documented.
+
+Shadow mode validates v2 without any production effect. If v2 says "requirement missing" and v1 says "satisfied," we investigate (spec bug? import bug? data-quality issue?). We fix. We re-import. We re-diff. We iterate until confident.
+
+### 20.2 Pilot clients (Stage 6-7)
+
+Before opening v2 to "all new clients," a pilot runs with 2-5 real new clients hand-picked by Antonio:
+
+- These clients onboard on v2 from day one.
+- Antonio monitors their progression personally, with higher attention than normal.
+- Any v2 issue surfaced from a pilot client → dev_task + fix + scar.
+- Pilot runs 2 weeks minimum. If zero P0/P1 issues, broader cutover proceeds. If issues, delay.
+
+### 20.3 Cutover day protocol (2026-10-21)
+
+On cutover day, the sequence:
+
+**T-24h:**
+- Final shadow diff review across all 30 panel clients. Zero material diffs required.
+- Verify all env vars in Vercel `td-operations-v2`.
+- Verify domain `v2.tonydurante.us` resolves correctly.
+- Inngest dashboard green.
+- Anthropic/OpenAI quotas confirmed.
+- Announce to team (Antonio + Luca) that cutover is T-24h.
+
+**T-0 (morning):**
+- Deploy `td-operations-v2` to production Vercel.
+- Register Smart AI webhook URLs with Stripe, Whop, etc. (in addition to v1 URLs — both systems receive webhooks during the hybrid period).
+- New-client-facing offer flows updated to point to v2 URL (this is the switch — existing flows continue to point to v1 for existing clients).
+- Monitoring dashboards open. Team watching.
+
+**T+1h:** first expected new-client traffic on v2. Validate the full happy path (offer signed → payment → engagement → portal login → wizard start) via a test account.
+
+**T+24h:** if green, announce to team that cutover is stable. Daily reviews for 30 days. Shadow mode continues.
+
+### 20.4 Rollback plan
+
+If issues surface post-cutover:
+
+**Minor (cosmetic, single-feature bugs):**
+- Fix forward on v2. No rollback. Affected client contacted directly if client-visible.
+
+**Moderate (blocks new-client onboarding):**
+- Temporarily route new-client flow back to v1 while v2 is fixed.
+- Existing clients unaffected (always on v1).
+- Affected new clients: inform Antonio; manual onboarding if necessary.
+
+**Severe (data loss, PII leak, or similar):**
+- Immediate incident response.
+- Point DNS back to v1 for all v2 traffic.
+- Investigate root cause.
+- Scar index populated with incident.
+- Post-mortem published before re-cutting-over.
+
+### 20.5 Post-cutover: feature-by-feature migration (Stages 8+)
+
+After cutover, existing 253 v1 clients stay on v1. Each additional feature moves from v1 to v2 on a schedule:
+
+**Order (first 3 months post-cutover):**
+1. **ITIN applications** (Stage 8). Next most common service after formation.
+2. **Operating Agreement full generation** (Stage 9). Currently template-level only.
+3. **Lease generation** (Stage 10).
+4. **CMRA, Banking wizard flows** (Stage 11).
+5. **Annual renewal logic** (Stage 12). Most complex — installment-driven, recurring.
+
+Each feature migration:
+- Smart AI extends its spec, wires Inngest workflows, adds agent capabilities.
+- Shadow mode runs for the feature on v1 engagements that would use it.
+- Antonio pilot-migrates 2-5 existing v1 clients for that feature onto v2.
+- If clean, remaining v1 clients for that feature are migrated on a rolling schedule.
+- v1 code for that feature is deprecated when no clients remain on v1 version.
+
+**Target:** full v1 → v2 migration complete 6-9 months post-cutover. v1 becomes read-only archive. v2 is the sole live system.
+
+### 20.6 Migration rationale and devil's-advocate flags
+
+**[R101-FLAG on parallel-system maintenance.]** Running v1 and v2 simultaneously doubles the operational surface. v1 bug fixes, webhook signature rotations, client support — all happen in both systems.
+
+The resolution:
+1. **Forcing function: 2026-10-21 cutover caps v1 feature development.** After that date, v1 receives only maintenance (security patches, critical bug fixes) — no new features. All new work goes to v2.
+2. **v1 code freeze per feature once v2 ships that feature.** E.g., once Stage 8 ships ITIN in v2 and all v1 ITIN clients have migrated, v1 ITIN code is archived (moved to `deprecated/` directory, not deleted until 6 months later for reference).
+3. **Cost tracking per system.** v1 infrastructure cost is visible; dropping after full migration is the signal that v1 can be decommissioned.
+
+**[R101-FLAG on client confusion during hybrid period.]** Existing clients on v1 see the v1 portal (`portal.tonydurante.us`). New clients on v2 see the v2 portal (`v2.tonydurante.us` or whatever the production URL becomes). Two portals during the hybrid period.
+
+The resolution:
+1. Existing v1 clients continue to see the v1 portal they already know. No change for them.
+2. New v2 clients only know the v2 portal from day one. No exposure to v1.
+3. When an existing v1 client is migrated feature-by-feature, their portal stays on v1 until their engagement moves; at that point, their magic link + new credentials route to v2. Transition is explicit and communicated.
+
+**[R101-FLAG on synthesized v1 event history accuracy.]** When we import v1 engagements into v2, we synthesize events for past activity (since v1 didn't log events). The synthesis is best-effort; the event chain is not historically accurate.
+
+The resolution: synthesized events are flagged in the payload (`source: 'migration_synthesis'`). The solver treats them as evidence but the agent's context bundle notes which events are synthetic vs live. This preserves the distinction for forensic purposes and avoids misattributing responsibility.
+
+**[R101-FLAG on webhook re-registration errors.]** Registering a new webhook URL with Stripe/Whop is an API call. If the API returns an error and we don't notice, webhooks stop flowing.
+
+The resolution:
+1. Webhook re-registration is scripted (`scripts/webhook-register.ts`) with explicit success verification.
+2. Post-registration, we send a synthetic test event (via the provider's "send test webhook" feature) and verify it arrives at Smart AI and produces the expected event.
+3. Before DNS flip, both URLs receive production webhooks (belt and suspenders — if one fails, the other catches).
+
+---
+
+## 21. Governance and Session Discipline
+
+How the build is operated matters as much as what is built. This section specifies the protocols.
+
+### 21.1 The forcing function
+
+**2026-10-21. First new client on Smart AI TD Operations.**
+
+This date is referenced:
+- In `sysdoc_read('smart-ai-td-ops-architecture')` D7.
+- In the build dev_task `2bc839aa-2e8e-4841-85ff-8a3f304a68c5`.
+- In every Stage's exit criteria.
+- In every session's start protocol.
+
+Slipping past 2026-10-21 requires explicit Antonio decision — not silent drift. "We'll see where we are" is not acceptable; if a stage runs long, we explicitly discuss: extend or cut scope.
+
+### 21.2 R101 — Devil's Advocate Mandatory
+
+Section-by-section, this plan flags R101 concerns. In operation, R101 means:
+
+Before any plan, proposal, decision, or recommendation reaches Antonio, the producer (me, in-session) internally answers:
+1. What am I assuming?
+2. What did I consider and reject?
+3. How is my chosen approach weak?
+4. What's verified versus accepted?
+5. Am I picking this because it's easier to write, or because it's actually better?
+
+If any answer is missing or weak, the output is not ready.
+
+**Enforcement:**
+- Currently: self-discipline. Not reliable alone.
+- Coming: `plan_challenge` MCP tool (dev_task `24cfad54`). Required before significant proposals. Hard-block vs soft-warn decision pending.
+
+**This plan itself was produced under R101.** Section-level R101-FLAGs call out known weaknesses — designed to be attacked by external reviewers (Section 21.4).
+
+### 21.3 Session discipline
+
+**Per-session protocol:**
+1. Read `sysdoc_read('smart-ai-td-ops-architecture')`.
+2. Read `sysdoc_read('smart-ai-td-ops-stage-0-worklist')` (or current stage worklist).
+3. `git pull origin main` in the local repo.
+4. Query current dev_task progress.
+5. Work.
+6. Commit incrementally (after each significant change).
+7. Save `session_checkpoint` after each significant change.
+8. At session end, update progress log on the relevant sysdoc.
+
+**Multi-machine coordination:**
+- **MacBook is the lead machine for Smart AI.** iMac and Mac Mini continue v1 support during Stage 0-4. Once v2 architecture stabilizes (Stage 4+), other machines can contribute to v2 work.
+- Cross-machine rules (R070, R071, R076) carry forward: pull before work, never `git add -A`, never `git push --force`.
+
+**Session length and compaction:**
+- Claude Code sessions compact context when long. The architecture sysdoc + stage worklist survive compaction because they're in the DB, read at session start.
+- Session checkpoints save work-in-progress state so a fresh session can resume.
+- Critical decisions are committed to sysdocs immediately, not just in-conversation.
+
+### 21.4 Multi-session challenge protocol
+
+This plan is designed to be challenged by multiple fresh Claude sessions before Stage 0 S0.2 schema work begins. Protocol (proposed; awaiting Antonio sign-off to execute):
+
+**Round 1:**
+1. Antonio opens 2-3 fresh Claude sessions (Claude.ai web, or new Claude Code projects pointed at this repo).
+2. Each session receives: (a) this plan, (b) a structured challenge template.
+3. Structured challenge template asks, for each section N:
+   - Strongest argument AGAINST this section's approach.
+   - What assumption is most likely wrong.
+   - What failure mode this section doesn't address.
+   - Alternative approach + why.
+   - Verification: what 2-3 fresh tool calls would test this section's claims.
+4. Each session produces a challenge report.
+
+**Synthesis:**
+1. I (this session or a successor) read the 2-3 challenge reports.
+2. For each raised issue, produce a disposition: accepted (how to revise) / rejected (why) / escalate (needs Antonio decision).
+3. Write disposition to a sysdoc.
+4. Antonio signs off on the disposition.
+
+**Round 2 (optional):**
+If Round 1 surfaces major issues requiring substantial plan revision, Round 2 happens on the revised plan. Hard cap: 2 rounds. If Round 2 still finds material issues, ship the current plan with issues noted as deferred to Stage 1+.
+
+**Stop condition:** Round produces zero new material issues, OR Antonio declares the plan "good enough."
+
+### 21.5 Scope change management
+
+Scope changes during the build are expected. The protocol:
+
+- **Minor changes** (adding a field to a spec, a new event type, a UI tweak): in-session, commit to the plan and dev_task.
+- **Moderate changes** (new stage work, reordering, adding a service type): explicit Antonio decision; architecture sysdoc updated with a dated entry.
+- **Major changes** (changing a D1-D9 locked decision): requires a mini-plan-review — "what we locked, what changed, what it means." Updated in D9 with `SUPERSEDED (date)` notation, original decision preserved.
+
+**Scope creep watchdog:** every stage's dev_task has a "locked scope" section. If mid-stage a new requirement is identified, it's either accepted (timeline extends) or deferred (next stage). Not silently absorbed.
+
+### 21.6 Governance rationale and devil's-advocate flags
+
+**[R101-FLAG on session compaction gaps.]** Claude Code sessions compact. If compaction happens mid-stage and the successor session has outdated context, decisions can drift.
+
+The resolution: the architecture sysdoc is the persistent context. Every architectural decision lives there with a date and rationale. Compacted sessions re-read it at start and are bound by it. In-conversation decisions not yet in the sysdoc are at risk of loss — this is why the rule is "commit architectural decisions to sysdocs immediately."
+
+**[R101-FLAG on challenge round fatigue.]** Running 2 rounds of external challenge per major plan is real work — Antonio opens sessions, collects output, synthesizes. If every architectural change requires this, build cadence suffers.
+
+The resolution: multi-session challenge is for the foundational plan (this document) before Stage 0 begins. Per-stage changes don't require it; they're smaller scope and covered by per-session R101 discipline. The multi-session round is a capital investment in plan quality, not a continuous tax.
+
+**[R101-FLAG on MacBook-as-single-lead machine.]** If MacBook is unavailable (laptop broken, Antonio traveling), Smart AI work halts.
+
+The resolution: once Stage 0-1 patterns stabilize, a second machine (iMac or Mac Mini) can be a secondary lead. The architecture sysdoc + worklist + dev_task progress survives across machines because they're in Supabase. Git discipline (pull before work, explicit file adds) prevents desync.
+
+---
+
+## 22. Cost Model
+
+Every major cost driver, sized honestly at three scale points. This is not a forecast; it's a budget sizing exercise with explicit assumptions.
+
+### 22.1 Cost drivers
+
+1. **Claude API** — the big one. Scales with agent activity.
+2. **Inngest** — scales with workflow executions.
+3. **Supabase** — Pro tier flat plus storage overages.
+4. **Vercel** — Pro tier plus function invocations.
+5. **OpenAI (embeddings only)** — tiny, flat.
+6. **Sentry** — tier-based; flat for our volume.
+7. **Domain/DNS/certs** — negligible.
+
+### 22.2 Cost at 225 clients (first cutover scale)
+
+**Assumptions:**
+- ~10 agent invocations per client per day on average (mix of high and low activity clients).
+- Total agent invocations per month: 225 × 10 × 30 = ~67,500.
+- Average tokens per invocation: 4,000 input + 1,000 output = 5,000 total.
+- Model distribution: Haiku 70%, Sonnet 25%, Opus 5%.
+- Prompt caching effective on ~60% of input tokens (system prompt + SOPs + scars).
+- Batch API used for ~10% of invocations (nightly analyses).
+
+**Claude API — detailed math:**
+
+*Input tokens, no optimization:*
+- 67,500 × 4,000 = 270M input tokens/month
+- Haiku 70%: 189M × $1/1M = $189
+- Sonnet 25%: 67.5M × $3/1M = $202.5
+- Opus 5%: 13.5M × $5/1M = $67.5
+- Subtotal input (no cache): **$459**
+
+*Output tokens:*
+- 67,500 × 1,000 = 67.5M output tokens/month
+- Haiku 70%: 47.25M × $5/1M = $236.25
+- Sonnet 25%: 16.875M × $15/1M = $253.13
+- Opus 5%: 3.375M × $25/1M = $84.38
+- Subtotal output: **$574**
+
+*With prompt caching (60% of input cached, 90% discount on cached):*
+- Cached input value: 60% of $459 = $275 becomes $27.50 (90% off).
+- Uncached 40% stays at full price: $183.60.
+- Total input with caching: **$211**
+
+*With Batch API (10% of invocations at 50% off):*
+- Savings: 10% × ($211 input + $574 output) = $78.50 discount.
+
+*Final Claude API estimate: $211 + $574 - $78 = **~$707/month** at 225 clients.*
+
+**Other infrastructure:**
+- Inngest Pro: **$75/month** (base tier, expected to suffice at this volume).
+- Supabase Pro: **$25/month** (flat).
+- Vercel Pro: **~$200/month** including usage (per-seat + function invocations).
+- OpenAI embeddings: **~$10/month** (daily re-embeds of SOPs + scars, small corpus).
+- Sentry: **~$50/month** (team tier for error tracking + performance).
+
+**Total estimated cost at 225 clients: ~$1,067/month.**
+
+**Range with assumptions flex:** $900 (low end, fewer agent calls) to $1,400 (high end, more Opus usage).
+
+### 22.3 Cost at 500 clients (growth scale)
+
+Linear scaling for Claude API (agent work scales with client count):
+
+- Claude API: 500/225 × $707 ≈ **$1,571/month**.
+- Inngest: **$150-300/month** (scale into Pro tier overages).
+- Supabase Pro: $25 (Pro tier holds through much larger volumes).
+- Vercel Pro: **~$300/month** (more function invocations).
+- OpenAI embeddings: **~$20/month**.
+- Sentry: **~$80/month**.
+
+**Total at 500 clients: ~$2,146/month.**
+
+**Range:** $1,800 - $2,500.
+
+### 22.4 Cost at 1,000 clients (target scale)
+
+- Claude API: 1000/225 × $707 ≈ **$3,140/month**.
+- Inngest: **$400-600/month** (enterprise pricing, negotiated).
+- Supabase: may need to move beyond Pro to Team tier: **~$600/month**.
+- Vercel: **~$500-800/month** (enterprise).
+- OpenAI embeddings: **~$40/month**.
+- Sentry: **~$150/month**.
+
+**Total at 1,000 clients: ~$4,830-5,330/month.**
+
+**Range:** $3,500 (aggressive optimization) - $6,000 (unoptimized peak).
+
+### 22.5 Cost cap and alerts
+
+**First cutover hard cap: $4,000/month.**
+
+- Anchored to Antonio's current $4,000/month employee spend.
+- Alert at 80% projection ($3,200/month trajectory).
+- At 100% cap: non-critical agent invocations throttled (nightly analyses deferred; routine reminders queued if needed). Critical paths always execute.
+
+**Raising the cap:** Antonio's decision when scale demands. Expected around 500 clients; certain at 1,000.
+
+### 22.6 Cost vs quality trade-off
+
+From Section 1.4: *"I am already spending $4,000 for an employee that can do a quarter of what my broken system does today."*
+
+The principle: **do not cut quality to save cost.** If a client-visible action quality drops by 10% to save $500/month, the business loses more than $500 in reputation and retention.
+
+Specific policies:
+- **Do not downgrade models to save cost.** If Opus is the right tier for a task, use it. Haiku-ing a complex task and getting it wrong costs more than the Opus call.
+- **Do not skip prompt caching — free optimization.**
+- **Do not skip Batch API for batchable work — free 50%.**
+- **Do not run agent on every event if debounced signal works — free compute.**
+- **Do not run agent when solver output is cached and unchanged — free compute.**
+
+These are "zero-harm optimizations" — get them all. The remaining cost at that point is the true cost of running the system at quality.
+
+### 22.7 Cost tracking implementation
+
+- Every `ai.decision` and `agent.invoked` event logs `cost_usd` in payload.
+- Materialized view `monthly_cost_by_category` rolls up daily.
+- Dashboard surface in CRM admin: cost this month, projection for end-of-month, month-over-month trend, spike investigation.
+- Weekly email to Antonio: cost summary + outliers.
+
+### 22.8 Cost rationale and devil's-advocate flags
+
+**[R101-FLAG on optimistic cost modeling.]** My estimates above assume linear scaling with clients. In practice, complex clients (multi-service, long-lived, exception-heavy) consume more agent cycles than simple ones. The 1,000-client estimate could be low.
+
+The resolution: treat estimates as directional, not precise. Monitor actual cost-per-client; adjust. The cost cap is the real constraint, not the estimate.
+
+**[R101-FLAG on vendor cost changes.]** Anthropic, OpenAI, Inngest all have changed pricing before. A 30% price increase on Claude API would move the needle.
+
+The resolution:
+1. Monitor vendor announcements. Have a quarterly review of vendor costs.
+2. Abstraction layer (`lib/agents/llm.ts`) makes provider swap feasible. OpenAI and other providers are viable backups.
+3. Not locked into any one vendor's pricing forever.
+
+**[R101-FLAG on cost visible in event payloads vs actual billing.]** Our `cost_usd` in events is calculated from Anthropic's published pricing and token counts. Anthropic's invoice may differ (taxes, volume discounts we haven't negotiated, billing rounding).
+
+The resolution: reconcile monthly — Anthropic invoice vs. sum of logged costs. If divergence > 5%, investigate. The logged cost is for in-system attribution; the invoice is the authoritative spend.
+
+---
+
+## Appendix A — Locked Decisions D1 through D9
+
+The nine load-bearing architectural decisions signed off by Antonio on 2026-04-21. Each is referenced throughout the plan.
+
+### D1 — Workflow engine: Inngest (managed)
+**Decision:** Inngest. Not Temporal. Not homemade.
+**Rationale:** Vercel-native, serverless-first, observability baked in, days-to-ship (not weeks). No new ops surface. Designed for agent-heavy, event-driven workloads; avoids Temporal's LLM-payload saturation that forces external payload codec work.
+**Cost:** starts $75/mo (Pro tier); scales to $300-600/mo at 500-1,000 clients.
+**Revisit if:** we outgrow Vercel, or if workflows span months with hundreds of steps each.
+
+### D2 — Rules engine: TypeScript rules + CRM override layer
+**Decision:** Rules authored in TypeScript (type-safe, tested, versioned in Git). Runtime-editable values live in `rule_overrides` table with CRM UI.
+**What's editable at runtime:** prices, thresholds, reminder cadences, grace periods, conditional values, exceptions configuration.
+**What requires code:** new rule shapes, new rule categories, structural changes.
+**Rejected:** OPA/Rego (Antonio won't author it), Cedar (same), pure-JSONB-in-DB (no type safety, fragile).
+**Future extension (Stage 4+):** visual workflow builder à la Harvey AI's pattern (25,000 client-built workflows).
+
+### D3 — Agent architecture: single Ops Agent + strong context (Stage 1); specialists later
+**Decision:** Stage 1 ships ONE "Ops Agent" with scoped tools + per-client context bundles. Revised from earlier 6-agent proposal based on 2026 production research.
+**Rationale:** single-agent-with-good-context outperforms multi-agent for sequential workloads. Multi-agent pays off only when tasks run concurrently.
+**Specialists emerge later** (Billing, Tax, Compliance, Communications, Portal-Support) only when distinct concurrent workloads or model-tier needs justify.
+**Context bundle per invocation:** recent events, current solver state, retrieved SOPs via pgvector, retrieved v1 Scar Index entries relevant to the proposed action.
+
+### D4 — Hosting floor: Vercel + Supabase + Inngest. No new providers.
+**Decision:** Stay on Vercel for Next.js. Supabase for data + auth + realtime. Inngest for durable workflows.
+**Rationale:** Cloudflare's Vinext (Next.js on Workers) is experimental (Feb 2026 release, not battle-tested) — not production-ready. AI API calls go out regardless of host, so hosting doesn't change AI economics.
+**Added later (Stage 2+):** pgvector inside Supabase for retrieval. Upgrade to managed vector DB only if pgvector becomes bottleneck.
+
+### D5 — AI cost ceiling: $4,000/month hard cap, alert at 80% ($3,200)
+**Baseline model mix:** Claude Haiku 4.5 (70%), Sonnet 4.6 (25%), Opus 4.7 (5%). Prompt caching + Batch API applied wherever input is cacheable.
+**Estimated spend:** 225 clients → $900-1,400/mo. 500 → $1,800-2,500/mo. 1,000 → $3,500-5,000/mo (will require raising cap near capacity).
+**Anchor:** Antonio pays $4k/mo for an employee delivering ~25% of required output. AI spend under this ceiling is economically justified.
+**Priority:** quality over cost. Do not trade 10% quality for $500 savings.
+
+### D6 — First-cutover feature scope: new-client lifecycle only
+**In scope:** SMLLC + MMLLC Formation, Client Onboarding, Tax Return (intake + routing only), payment capture (Stripe/Whop/wire) with version-pinned pricing, Portal v2, CRM v2, Ops Agent, Inngest workflows for formation/onboarding/tax-intake.
+**Out of scope:** ITIN, Closure, CMRA, Banking wizard, OA/Lease generation, annual renewal, QB sync, India tax routing, bank statements, referrals, ~40 secondary MCP tools.
+**Existing 253 clients:** stay on v1 through cutover. Feature-by-feature migration in batches after.
+
+### D7 — Forcing function: cutover 2026-10-21 (6 months from decision)
+**First new client lands on Smart AI TD Operations on 2026-10-21.**
+If 7-8 months proves necessary, extend explicitly with Antonio approval.
+If 12+ months, it's a red flag. Antonio should challenge me.
+Date is checked at every session start. Drifting past requires explicit decision, not silent slide.
+
+### D8 — Sandbox + Vercel + repo isolation (strict)
+**Smart AI Supabase ref:** `tapbgvbglqacamhayfel` (verified alive 2026-04-21).
+**Smart AI Vercel project:** `td-operations-v2`. Not sharing deployment, domains, or env vars with v1.
+**Smart AI GitHub repo:** `TonyDuranteSystem/td-operations-smart-ai`.
+**Smart AI local directory:** `~/Developer/td-operations-smart-ai/` on MacBook.
+**Smart AI CLAUDE.md:** new file in new repo. Inherits only R070 + R091 + R093 + R101 from v1.
+**v1 sandbox `xjcxlmlpeywtwkhstjlw`** continues for v1 testing.
+**Hard rule:** no v1 env var, webhook URL, Supabase ref, or API endpoint appears in Smart AI config and vice versa. `EXPECTED_SUPABASE_REF` assertion enforces at boot.
+
+### D9 — What stays shared with v1, what stays separate
+**Shared:** `knowledge_articles` (Master Rules KB, R060-canonical), `sop_runbooks` (procedures). Business rules don't split when code does. Smart AI reads these from v1's Supabase via a read-only retrieval layer.
+**Separate:** code repo, CLAUDE.md, local directory, dev_tasks, session_checkpoints, action_log, MCP server instance, Vercel project, domains.
+**Hybrid (project-management artifacts):** architecture sysdocs, stage worklists, build dev_task live in v1's Supabase for now (one read surface for Antonio). May migrate to Smart AI's Supabase post-cutover.
+
+---
+
+## Appendix B — S0.8 Verification Panel (30 Clients)
+
+Antonio-selected panel for the Stage 0 S0.8 exit gate. Scope locked 2026-04-21. Full list verified via live queries.
+
+### Anchor (1 — Antonio's pick)
+| Company | Account ID | Entity | State | Note |
+|---|---|---|---|---|
+| Oh My Creatives LLC | `fb534d22-1b06-45ae-8cc6-6a3007f1a489` | MMLLC | NM | MMLLC classification but only 1 member in junction — data oddity edge case |
+
+### SMLLC clean recent (5)
+| Company | Account ID | State |
+|---|---|---|
+| AG Group LLC | `9c3d5f5b-cad8-4739-b990-65fe0ae0ba10` | NM |
+| MDL Advisory LLC | `7898b4df-5fed-45fb-b31b-13134320e711` | NM |
+| Trade Charls LLC | `02d22896-2c40-4459-80ad-d18a155185c2` | WY |
+| SD Int. LLC | `158c717b-80e7-4f63-a75d-94855723ed8b` | DE (also long-lived) |
+| DF Commerce LLC | `63392d94-c327-443f-b5b1-bee7a5e923d5` | WY |
+
+### MMLLC clean recent (5)
+| Company | Account ID | State |
+|---|---|---|
+| PTBT Holding LLC | `7b3bb40b-0249-4dd4-8df1-85c86393a71a` | WY |
+| Zhang Holding LLC | `9d068106-0ba8-40ae-a23c-acb76129cd77` | WY |
+| Univexa International LLC | `59ae90bf-b629-4c22-9cba-029830fba9f2` | FL |
+| DigitalBox LLC | `5250ec1c-a3a8-47fe-8f39-1ebf4b3862f2` | FL |
+| Estro LLC | `fa6480ba-96d5-4141-b3a0-5ca9d5c1a51c` | WY |
+
+### Multi-service (8 — heaviest histories)
+| Company | Account ID | Entity | SDs | Service types |
+|---|---|---|---|---|
+| FBC Consulting & Services LLC | `707836b5-558f-4f00-8e8c-ad77c6125852` | SMLLC | 25 | Formation, EIN, ITIN, CMRA, State Annual Report, State RA Renewal, Tax Return, Annual Renewal |
+| SDM Consulting LLC | `5e2e105b-2ef5-40ab-b058-df11b2f7847d` | SMLLC | 24 | Same minus ITIN |
+| Papi Consulting LLC | `1fb1cc84-df3d-42d1-bc6f-3772844f66c5` | SMLLC | 24 | Same minus ITIN |
+| Intubati EM LLC | `fbd57ff1-f3ac-42b5-bf5c-9a680d3cf67a` | C-Corp | 21 | CMRA, State Annual Report, RA Renewal, Tax Return |
+| Entregarse US LLC | `a2d2f660-8da9-4645-a478-54a8c1c1339d` | C-Corp | 15 | Full stack |
+| Dieffe International LLC | `8fe3dfed-165c-48a3-8c1d-75bc289f6417` | SMLLC | 13 | Full stack |
+| Beril LLC | `60c22f1d-deca-45b7-accb-f0161611ab34` | C-Corp | 11 | Full stack (also long-lived) |
+| Carasso Consulting LLC | `79d888f4-dc48-492d-8d2f-45bd79b1c9a7` | SMLLC | 9 | Full stack |
+
+### Long-lived by formation date (8, Beril and SD Int. dedup)
+| Company | Account ID | Formed | State |
+|---|---|---|---|
+| Beril LLC | `60c22f1d-...` | 2020-04-09 | FL |
+| Lucky Pama LLC | `bb303823-7928-4932-8c21-2842e1de6067` | 2020-06-23 | FL |
+| Diendei LLC | `710fe3b9-c997-45ea-9619-208a58fa960e` | 2020-07-08 | FL |
+| VSV210 LLC | `d5dfe3b9-2a14-482a-8ba7-e06c129d52ee` | 2020-08-05 | FL |
+| UC Marketing LLC | `656bd001-5e5a-4dac-89be-b0c2287ebfd9` | 2021-09-28 | WY |
+| Web Media Capital LLC | `9e5c1499-9137-4234-9f7d-bc12abfca26e` | 2021-12-09 | DE |
+| SD Int. LLC | `158c717b-...` | 2021-12-10 | DE |
+| Xecom Consulting LLC | `89d13729-1714-4244-b124-c5372b926297` | 2022-03-23 | FL |
+
+### At-risk by health (5)
+| Company | Account ID | State | Health |
+|---|---|---|---|
+| VictoriamRoas LLC | `0c3e0fc0-3cda-4c93-9bbc-fa127626257b` | WY | red |
+| DeP Consulting LLC | `a14b2c55-211f-4561-b7a4-ac77ef462e20` | WY | yellow |
+| CF Consulting LLC | `3ce8e39d-b1fc-4ac3-8c81-c34b01dc11e7` | WY | red |
+| Universe 369 LLC | `cabee2a6-e6ea-4fd4-891e-4611ee296f72` | WY | red |
+| SP INTERNATIONAL LLC | `90810c0f-24f8-4cc7-a5ba-d366f8a67309` | NM | red |
+
+**Total unique: 30.** Beril and SD Int. each appear in two categories (multi-service + long-lived, and SMLLC-clean + long-lived respectively) — deduped in the import loop.
+
+**Exit gate strategy: triage by root cause**, not by client. Zero-or-explained diff across unique root causes. Details in Section 7 (Solver) and Section 20 (Migration).
+
+---
+
+## Appendix C — v1 vs v2 — What Actually Changes
+
+Side-by-side for reviewer clarity. What exists in v1 today, what v2 replaces it with, and why.
+
+| Aspect | v1 TD Operations | Smart AI v2 | Rationale |
+|---|---|---|---|
+| **Data model** | 70+ tables, evolved organically. `accounts` + `contacts` + `account_contacts` junction. | 5 core entities + event log + specs + exceptions + scars + proposals. | Deliberate layering; each table has a clear purpose. |
+| **Membership** | `account_contacts` — join table, flat. | `account_members` — with `is_signer`, `left_at`, `added_by`, `role` lifecycle. | Member-lifecycle events are first-class; signer swap is one update. |
+| **Pre-account entity** | Placeholder account pattern — real account created with fake data, updated later. | `engagements` — commercial relationship anchor, nullable `account_id`. | No placeholder pollution. |
+| **State changes** | 176 direct DB writes across MCP tools, webhooks, cron jobs. | Every state change = `emit()` → events + outbox. | No silent writes. Audit trail complete. |
+| **Rules location** | Scattered: code (`lib/`), prose (CLAUDE.md, SOPs), DB (various tables). | Specs in TypeScript, runtime overrides in `rule_overrides`, AI evaluation for edge cases. | Edit pricing in the CRM, not a code deploy. |
+| **Service type identifier** | 85 hardcoded string literals across `lib/` and `app/`. | Spec-ID-driven; no string literals. | Adding a new service = new spec, zero code changes. |
+| **Workflows** | Cron + webhook + action_log, inconsistent retry. | Inngest durable workflows with step-level retry, built-in observability. | Reliability and visibility. |
+| **AI** | MCP tools for Claude Code dev sessions; no runtime agent layer. | Ops Agent with tools, scar retrieval, structured outputs, multi-model tiering. | AI is a first-class operator. |
+| **Portal** | Per-service-type pages. Adding a service = new pages + components. | Solver-driven rendering. Spec change = immediate portal update. | Flexibility, consistency. |
+| **CRM** | Tabbed by entity type (Accounts / Contacts / Tasks). | Intelligence-first (Needs Action / Blocked / Proposals / Anomalies). | Operational surface matches operator mental model. |
+| **Exceptions** | Informal (notes field, ad-hoc overrides). | First-class `exceptions` table, typed exception_type, audited, pattern-detected. | Flexibility without fragility. |
+| **PII** | Mostly in-table (EIN, ITIN, passport_number as text columns). | Tokenized in events; raw in `sensitive_data` with encryption + RLS. | GDPR-safe, audit-safe. |
+| **Schema changes** | Scripts in `scripts/sandbox-seed/`, applied manually. | Supabase migrations in `supabase/migrations/`, applied via `supabase db push`. | Repeatable, reversible. |
+| **Observability** | Sentry + ad-hoc logging. | Sentry + Inngest dashboard + custom metrics + SLOs + calibration dashboards. | Silent failures become visible failures. |
+| **Workflow engine** | Cron + webhooks; retry is manual or ad-hoc. | Inngest durable workflows with automatic retry, step-level checkpointing. | Reliability at scale. |
+| **Hosting** | Vercel + Supabase. | Vercel + Supabase + Inngest. | Same bones; workflow engine added. |
+| **Shadow mode / testing** | Sandbox as mirror of prod; manual testing. | Shadow mode tees v1 webhooks into v2 for continuous comparison. | Continuous validation vs periodic. |
+| **Migration path** | N/A. | Feature-by-feature post-cutover. | Bounded risk per feature. |
+
+---
+
+## Appendix D — Glossary
+
+- **Account** — a company (LLC, C-Corp) in the system. Has `entity_type`, `state_of_formation`, `status`, members, services. Not the same as a contact.
+- **Agent (Ops Agent)** — the AI layer that reads solver output and proposes actions. Single agent at Stage 1 with scoped tools and context bundles.
+- **Blast radius** — the reach of a proposed action. `internal_only` (TD-facing), `admin_only` (surfaces to admin), `client_visible` (reaches a client). Blast-radius gating determines whether auto-execution is allowed.
+- **Cache invalidation** — event-driven. Every event that touches an engagement's subject invalidates the solver cache for that engagement.
+- **Calibration** — the empirical measurement of (AI confidence, actual accuracy) pairs, used to adjust auto-execution thresholds.
+- **Case (informal usage)** — the compound state of a client across all their engagements, services, payments, and deadlines. Not an explicit entity in v2 at Stage 1; rendered on-demand by composing solver outputs per account. Future consideration if operational pain forces it.
+- **Contact** — a person in the system. Can be a client, a member of an LLC, a signer. One contact can belong to multiple accounts via `account_members`.
+- **Context bundle** — the assembled payload passed to the Ops Agent on each invocation. Contains engagement state, recent events, retrieved SOPs, retrieved scars, policy context, and task specification.
+- **Cutover** — the date v2 accepts its first new client. 2026-10-21 per D7.
+- **Devil's advocate (R101)** — the five-question self-challenge required before any plan, proposal, or decision. Enforced by the `plan_challenge` MCP tool (dev_task `24cfad54`).
+- **Emit** — the single entry point for writing to the event log. `emit(event)` writes to `events` + `outbox` atomically.
+- **Engagement** — a commercial relationship around a specific contract (Formation, Onboarding, Tax, Renewal, Closure). Pre-account existence allowed (nullable `account_id`). Spec-pinned, price-pinned at creation.
+- **Event** — an immutable record of a state change. Append-only. Includes type, subject, actor, payload, causation chain.
+- **Exception** — a formal override of a requirement. Typed (skip / defer / substitute / override_value). Approved, reasoned, auditable.
+- **Forcing function** — 2026-10-21 cutover date. Not optional. Slipping requires explicit decision, not silent drift.
+- **Inngest** — the durable workflow engine. Managed, Vercel-native, event-triggered.
+- **Member** — a person linked to an account via `account_members`. Has role, ownership percentage, signer designation, join/leave dates.
+- **MCP server** — the tool surface exposed to Claude Code sessions. Smart AI has its own MCP separate from v1's.
+- **Outbox** — the transactional outbox pattern for atomic event emission. `events` + `outbox` inserts happen in one Postgres transaction; drain worker publishes async.
+- **Proposal** — an agent-generated action recommendation. Reviewed by admin (client-visible ones always) or auto-executed (internal_only, gated by blast radius + scar match + confidence).
+- **R093** — CLAUDE.md rule: No Assumptions. Every fact must come from a fresh tool call in the current session.
+- **R101** — CLAUDE.md rule: Devil's Advocate Mandatory. Five-question self-challenge before any plan or proposal.
+- **Requirement** — a unit of "done" within a specification. Types: gate, data, document, deliverable. Has dependencies, scope (per-member or per-account), and optional `ai_evaluable` flag.
+- **Scar (v1 Scar)** — a structured record of a past v1 failure, with category, root cause, Smart AI prevention, and verification path. Used build-time and runtime.
+- **Scar Index** — the `v1_scars` table + pgvector retrieval. The learning layer.
+- **Shadow mode** — the validation approach: v1 production webhooks tee into v2 read-only for continuous comparison without client-facing effect.
+- **Sensitive data** — PII (passport, ITIN, EIN, SSN, DOB). Stored in `sensitive_data` with encryption + per-row RLS; referenced elsewhere via opaque tokens.
+- **Solver** — the pure function that takes a spec + engagement state and returns a `StatusReport`. Deterministic. No DB writes.
+- **Specification (Spec)** — TypeScript-authored contract for what a service type looks like. Includes requirements, pricing rules, follow-up cadences, exception configuration. Seeded to `service_specs` at deploy.
+- **Stage** — a discrete build phase with entry conditions and exit criteria. Stages 0-7 detailed in Section 19.
+- **Structured output** — Anthropic tool-use API constraint that forces agent responses into a typed JSON schema. Prevents hallucinated citations or malformed outputs.
+- **TD** — Tony Durante LLC. The business.
+
+---
+
+## Appendix E — References
+
+### Sysdocs
+- `smart-ai-td-ops-architecture` — canonical locked decisions D1-D9 + Scar Index subsystem. Read at every Smart AI session start.
+- `smart-ai-td-ops-stage-0-worklist` — Stage 0 tasks S0.0-S0.9, live-maintained progress.
+- `session-context` (v1) — v1's cross-session context hub.
+- `target-control-model-challenge.md` (working tree, v1 repo) — prior analysis of v1's control-model gap; informed the engagement-vs-case distinction.
+- `sandbox-reality-assessment.md` (working tree) — informed the shadow-mode strategy.
+- `operating-model-assessment.md` (working tree) — informed governance and R101 rule.
+
+### Dev tasks
+- `2bc839aa-2e8e-4841-85ff-8a3f304a68c5` — "v2 Smart System — Build (Cutover 2026-10-21)". Main tracker.
+- `24cfad54-f764-4510-9397-b0625a8849f8` — "R101 enforcement — plan_challenge MCP tool + pre-response gate". Enforcement mechanism.
+
+### Commits (v1 repo)
+- `3e40d46` — R101 added to v1 CLAUDE.md (banner in Verification Protocol + one-liner in Error-Magnet Rules).
+- `1dbfa33` — QB sync manual-only enforcement (R097 commit).
+- `4d5f403` — `offer-signed` webhook decoupled from leads.status transition (R094 commit).
+- `49d64df` — Soft-delete pattern for client-visible content (R100 commit).
+- `b80ecef` — Server error surfacing on client-side fetch (R099 commit).
+
+### Commits (Smart AI repo)
+- `baa4c5e` — Initial skeleton (CLAUDE.md, .gitignore, directory structure).
+- `b8d8c75` — R101 inherited in Smart AI CLAUDE.md.
+- `38c76f2` — docs(architecture): Part 1 of this plan.
+- `845ec2e` — docs(architecture): Part 2.
+- `caabd76` — docs(architecture): Part 3.
+
+### Research citations (for Claude API + agent design)
+- [Inngest vs Temporal durable workflows (2026)](https://www.inngest.com/compare-to-temporal)
+- [Durable Workflow Platforms for AI Agents and LLM Workloads (Render, 2026)](https://render.com/articles/durable-workflow-platforms-ai-agents-llm-workloads)
+- [Harvey AI platform](https://www.harvey.ai/platform)
+- [Basis scales accounting with OpenAI agents](https://openai.com/index/basis/)
+- [Anthropic API pricing 2026](https://www.finout.io/blog/anthropic-api-pricing)
+- [Agentic workflow production patterns (Virtido, 2026)](https://virtido.com/blog/agentic-workflows-patterns-best-practices-enterprise)
+- [Production-grade agentic AI workflows (arxiv 2512.08769)](https://arxiv.org/abs/2512.08769)
+
+### Business rules / SOPs (v1)
+- Master Rules KB: `knowledge_articles` in v1 Supabase (article `370347b6` — canonical per R060).
+- SOP runbooks: `sop_runbooks` in v1 Supabase.
+- CLAUDE.md R005-R101 (v1 repo root).
+
+---
+
+**End of plan.**
+
+This document is open for structured challenge per Section 21.4 before Stage 0 S0.2 schema work begins. R101-FLAGs throughout each section are the invitation. Bring your best adversarial read.
+
