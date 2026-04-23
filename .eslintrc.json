@@ -1,5 +1,6 @@
 {
   "extends": ["next/core-web-vitals", "next/typescript"],
+  "ignorePatterns": [".next/", "next-env.d.ts", "node_modules/", "out/", "build/", "dist/"],
   "rules": {
     "no-debugger": "error",
     "no-unreachable": "error",
@@ -41,6 +42,10 @@
     {
       "files": ["lib/events/emit.ts"],
       "rules": { "no-restricted-syntax": "off" }
+    },
+    {
+      "files": ["scripts/**/*.ts", "tests/**/*.ts", "tests/**/*.tsx"],
+      "rules": { "no-console": "off" }
     }
   ]
 }

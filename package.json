@@ -15,7 +15,8 @@
     "lint": "eslint . --ext .ts,.tsx --max-warnings 0",
     "lint:fix": "eslint . --ext .ts,.tsx --fix",
     "lint:staged": "lint-staged",
-    "assert:entity-table-sync": "tsx scripts/assert-entity-table-sync.ts"
+    "assert:entity-table-sync": "tsx scripts/assert-entity-table-sync.ts",
+    "db:migrate": "tsx scripts/apply-migrations.ts"
   },
   "lint-staged": {
     "*.{ts,tsx}": [
