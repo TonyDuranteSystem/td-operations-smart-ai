@@ -1,14 +1,38 @@
 /**
  * Smart AI TD Operations — runtime config invariants (architecture D8).
  *
- * EXPECTED_SUPABASE_REF is the literal Smart AI Supabase project ref. Any code
- * that connects to Supabase asserts this before opening a client. Mismatch = fatal.
- * This file is imported at module load by supabase-admin.ts and middleware.ts.
+ * Smart AI has TWO Supabase projects:
+ *   - SANDBOX_SUPABASE_REF — used during Stage 0–1 for all development work.
+ *     Contains a v1-clone dataset for shadow-mode + panel verification.
+ *   - PROD_SUPABASE_REF — created 2026-04-23. Empty slate. At cutover, new
+ *     Smart AI clients land here. During Stage 0–1, migrations are applied
+ *     to BOTH so the cutover promotion workflow is rehearsed continuously.
+ *
+ * EXPECTED_SUPABASE_REF is the ref the *running app* expects. Set by env
+ * var at deploy time; defaults to sandbox for Stage 0 dev. Mismatch at
+ * runtime = fatal (supabase-admin.ts + middleware.ts both call assertSmartAiRef).
+ *
+ * FORBIDDEN_SUPABASE_REFS are v1 refs. Any code path that touches them
+ * must refuse. Migration scripts check the connection string against this
+ * list before opening a client.
  */
 
-export const EXPECTED_SUPABASE_REF = 'tapbgvbglqacamhayfel' as const;
+export const SANDBOX_SUPABASE_REF = 'tapbgvbglqacamhayfel' as const;
+export const PROD_SUPABASE_REF    = 'wxzomfntgnkryyzytcir' as const;
 
-const V1_PROD_REF = 'ydzipybqeebtpcvsbtvs';
+export const SMART_AI_SUPABASE_REFS: readonly string[] = [
+  SANDBOX_SUPABASE_REF,
+  PROD_SUPABASE_REF,
+];
+
+// EXPECTED_SUPABASE_REF is the currently-configured runtime target. At Stage 0
+// it is sandbox. At cutover, Vercel prod env flips this to PROD_SUPABASE_REF.
+// Kept as a typed string (not a literal union) so an env-driven override in
+// future deploys does not require a type change.
+export const EXPECTED_SUPABASE_REF: string =
+  process.env.EXPECTED_SUPABASE_REF ?? SANDBOX_SUPABASE_REF;
+
+const V1_PROD_REF    = 'ydzipybqeebtpcvsbtvs';
 const V1_SANDBOX_REF = 'xjcxlmlpeywtwkhstjlw';
 
 export const FORBIDDEN_SUPABASE_REFS: readonly string[] = [V1_PROD_REF, V1_SANDBOX_REF];

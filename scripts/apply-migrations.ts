@@ -1,28 +1,64 @@
 /**
- * Apply SQL migrations to the Smart AI Supabase project.
+ * Apply SQL migrations to a Smart AI Supabase project.
  *
- * Per R096 (sandbox-first DDL): this runs against the Smart AI sandbox
- * `tapbgvbglqacamhayfel`. The `EXPECTED_SUPABASE_REF` guard refuses to
- * proceed if the connection string's host doesn't match.
+ * Smart AI has two projects: sandbox (Stage 0 dev) and production (created
+ * 2026-04-23, cutover target 2026-10-21). Every migration lands in BOTH.
+ * Apply order: sandbox first, verify, then production. This rehearses the
+ * cutover promotion workflow continuously through Stage 0–1.
+ *
+ * Three concentric guards make v1 contamination impossible:
+ *   (1) Required --target flag (no default — you must say which you mean).
+ *   (2) Connection string MUST contain the target's Smart AI ref.
+ *   (3) Connection string MUST NOT contain any v1 ref (prod or sandbox).
+ * The pg client uses a connection-string password scoped to the target
+ * project. v1 DB passwords are not available to this script; even maximal
+ * misconfiguration cannot reach v1.
  *
  * Usage:
- *   SUPABASE_DB_URL="postgresql://postgres.tapbgvbglqacamhayfel:PASSWORD@..." \
- *     npx tsx scripts/apply-migrations.ts
+ *   SUPABASE_DB_URL="postgresql://postgres.<ref>:<PASSWORD>@..." \
+ *     npx tsx scripts/apply-migrations.ts --target=sandbox
+ *   SUPABASE_DB_URL="postgresql://postgres.<ref>:<PASSWORD>@..." \
+ *     npx tsx scripts/apply-migrations.ts --target=production
  *
- * Tracks applied migrations in schema_migrations table. Idempotent.
+ * Tracks applied migrations in schema_migrations table. Idempotent:
+ *   - Identical content (by sha256) = SKIP.
+ *   - Changed content for an already-applied filename = ABORT (migrations
+ *     are immutable once applied; write a new migration to change behaviour).
  */
 
 import { readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { Client } from 'pg';
-import { EXPECTED_SUPABASE_REF, FORBIDDEN_SUPABASE_REFS } from '../lib/config';
+import {
+  FORBIDDEN_SUPABASE_REFS,
+  PROD_SUPABASE_REF,
+  SANDBOX_SUPABASE_REF,
+} from '../lib/config';
 
 const MIGRATIONS_DIR = path.resolve(__dirname, '..', 'supabase', 'migrations');
 
-function assertSmartAiConnectionString(url: string): void {
-  // Supabase pooled or direct URLs both contain the project ref. The strictest
-  // check: reject any string that contains a forbidden v1 ref, AND require the
-  // expected ref to appear somewhere.
+type Target = 'sandbox' | 'production';
+
+function parseTarget(argv: string[]): Target {
+  const flag = argv.find(a => a.startsWith('--target='));
+  if (!flag) {
+    throw new Error(
+      'Missing --target flag. Usage: npx tsx scripts/apply-migrations.ts --target=sandbox|--target=production'
+    );
+  }
+  const value = flag.slice('--target='.length);
+  if (value !== 'sandbox' && value !== 'production') {
+    throw new Error(`Invalid --target value "${value}". Must be "sandbox" or "production".`);
+  }
+  return value;
+}
+
+function expectedRef(target: Target): string {
+  return target === 'sandbox' ? SANDBOX_SUPABASE_REF : PROD_SUPABASE_REF;
+}
+
+function assertSmartAiConnectionString(url: string, target: Target): void {
+  // Guard 1: reject any v1 ref.
   for (const forbidden of FORBIDDEN_SUPABASE_REFS) {
     if (url.includes(forbidden)) {
       throw new Error(
@@ -30,22 +66,35 @@ function assertSmartAiConnectionString(url: string): void {
       );
     }
   }
-  if (!url.includes(EXPECTED_SUPABASE_REF)) {
+  // Guard 2: require the selected target's Smart AI ref.
+  const required = expectedRef(target);
+  if (!url.includes(required)) {
     throw new Error(
-      `FATAL: connection string does not contain expected Smart AI ref "${EXPECTED_SUPABASE_REF}". Refusing to run migrations.`
+      `FATAL: --target=${target} but connection string does not contain ref "${required}". Refusing.`
+    );
+  }
+  // Guard 3: refuse if the OTHER Smart AI ref appears (catches a sandbox URL
+  // passed with --target=production or vice versa).
+  const other = target === 'sandbox' ? PROD_SUPABASE_REF : SANDBOX_SUPABASE_REF;
+  if (url.includes(other)) {
+    throw new Error(
+      `FATAL: --target=${target} but connection string contains the other Smart AI ref "${other}". Refusing.`
     );
   }
 }
 
 async function main(): Promise<void> {
+  const target = parseTarget(process.argv);
+  console.log(`[apply-migrations] target: ${target} (expected ref: ${expectedRef(target)})`);
+
   const dbUrl = process.env.SUPABASE_DB_URL;
   if (!dbUrl) {
     console.error('SUPABASE_DB_URL is not set. Get it from Supabase dashboard →');
-    console.error('Project Settings → Database → Connection string (URI, session pooler).');
+    console.error('Project Settings → Database → Connection string → Session pooler tab.');
     process.exit(1);
   }
 
-  assertSmartAiConnectionString(dbUrl);
+  assertSmartAiConnectionString(dbUrl, target);
 
   const files = readdirSync(MIGRATIONS_DIR)
     .filter(f => f.endsWith('.sql'))

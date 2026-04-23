@@ -2,18 +2,33 @@ import { describe, it, expect } from 'vitest';
 import {
   EXPECTED_SUPABASE_REF,
   FORBIDDEN_SUPABASE_REFS,
+  PROD_SUPABASE_REF,
+  SANDBOX_SUPABASE_REF,
+  SMART_AI_SUPABASE_REFS,
   extractSupabaseRef,
   assertSmartAiRef,
 } from '@/lib/config';
 
 describe('config / D8 tripwire', () => {
-  it('expected ref is the Smart AI project', () => {
-    expect(EXPECTED_SUPABASE_REF).toBe('tapbgvbglqacamhayfel');
+  it('sandbox and prod refs are the Smart AI projects', () => {
+    expect(SANDBOX_SUPABASE_REF).toBe('tapbgvbglqacamhayfel');
+    expect(PROD_SUPABASE_REF).toBe('wxzomfntgnkryyzytcir');
+    expect(SMART_AI_SUPABASE_REFS).toEqual([SANDBOX_SUPABASE_REF, PROD_SUPABASE_REF]);
+  });
+
+  it('EXPECTED_SUPABASE_REF defaults to sandbox when env is unset', () => {
+    // env-driven; tests run without EXPECTED_SUPABASE_REF set, so default is sandbox
+    expect(EXPECTED_SUPABASE_REF).toBe(process.env.EXPECTED_SUPABASE_REF ?? SANDBOX_SUPABASE_REF);
   });
 
   it('forbids v1 prod and v1 sandbox refs explicitly', () => {
     expect(FORBIDDEN_SUPABASE_REFS).toContain('ydzipybqeebtpcvsbtvs');
     expect(FORBIDDEN_SUPABASE_REFS).toContain('xjcxlmlpeywtwkhstjlw');
+  });
+
+  it('does not list Smart AI refs among forbidden', () => {
+    expect(FORBIDDEN_SUPABASE_REFS).not.toContain(SANDBOX_SUPABASE_REF);
+    expect(FORBIDDEN_SUPABASE_REFS).not.toContain(PROD_SUPABASE_REF);
   });
 
   it('extracts ref from a canonical Supabase URL', () => {
@@ -26,7 +41,7 @@ describe('config / D8 tripwire', () => {
     expect(extractSupabaseRef('not a url')).toBeNull();
   });
 
-  it('assertSmartAiRef accepts the Smart AI ref', () => {
+  it('assertSmartAiRef accepts the sandbox ref', () => {
     expect(() => assertSmartAiRef('https://tapbgvbglqacamhayfel.supabase.co')).not.toThrow();
   });
 
