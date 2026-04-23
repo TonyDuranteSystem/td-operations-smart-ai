@@ -8,10 +8,17 @@ You are working on **Smart AI TD Operations**, the greenfield AI-first successor
 
 Before any work in this repo, read in this order:
 
-1. `sysdoc_read('smart-ai-td-ops-architecture')` — canonical locked architectural decisions. Drift-prevention insurance.
-2. `sysdoc_read('smart-ai-td-ops-stage-0-worklist')` — current stage worklist.
-3. Query `dev_tasks` for "Smart AI TD Operations — Build" (ID `2bc839aa-2e8e-4841-85ff-8a3f304a68c5`) — progress log.
+1. Read the architecture sysdoc from Smart AI Supabase (`tapbgvbglqacamhayfel`), `system_docs` WHERE `slug = 'smart-ai-td-ops-architecture'`. Drift-prevention insurance.
+2. Read the stage-0 worklist from Smart AI Supabase, `system_docs` WHERE `slug = 'smart-ai-td-ops-stage-0-worklist'`.
+3. Read the Smart AI dev_task from Smart AI Supabase, `dev_tasks` WHERE `id = '2bc839aa-2e8e-4841-85ff-8a3f304a68c5'` — progress log.
 4. `git pull origin main` — sync with the lead machine (MacBook).
+
+**Never read Smart AI sysdocs/dev_tasks from v1 prod (`ydzipybqeebtpcvsbtvs`).** Prior to 2026-04-23 they lived there; they were migrated to Smart AI Supabase on 2026-04-23. v1 prod copies are stale.
+
+**How to read/write Smart AI Supabase** (until Smart AI MCP ships — S0.0 pending):
+- Use the Supabase Management API: `POST https://api.supabase.com/v1/projects/tapbgvbglqacamhayfel/database/query` with `{"query": "..."}` body.
+- Auth: `Authorization: Bearer <SUPABASE_ACCESS_TOKEN>` — personal access token from [supabase.com/dashboard/account/tokens](https://supabase.com/dashboard/account/tokens). Expires every 30 days — rotate when expired.
+- **Never use v1's `sysdoc_read`, `execute_sql`, `dev_task_*`, or `session_checkpoint` MCP tools for Smart AI work** — those go to v1 prod. v1 MCP tools are fine for cross-reference READS of v1 data (knowledge_articles, sop_runbooks per D9), never for Smart AI writes.
 
 **The architecture sysdoc is canonical.** If a session proposal conflicts with it, the sysdoc wins unless explicitly superseded with Antonio's approval (and the sysdoc updated in the same motion).
 
@@ -46,7 +53,9 @@ Runtime: the Ops Agent retrieves relevant scars into its context bundle before e
 
 ## Save after every significant action
 
-The Smart AI MCP server is not yet configured (Stage 0 S0.0). Until then, use v1's `session_checkpoint` with explicit "Smart AI" prefix in the summary.
+The Smart AI MCP server is not yet configured (Stage 0 S0.0). Until then, update the progress_log on the Smart AI dev_task (`2bc839aa...` on Smart AI Supabase `tapbgvbglqacamhayfel`) via Management API curl — NOT via v1's MCP tools.
+
+**Never call `session_checkpoint` MCP for Smart AI work** — that tool writes to v1 prod's `session_checkpoints` table. For Smart AI, the progress_log on the Smart AI dev_task is the checkpoint surface until the Smart AI MCP + its own `session_checkpoints` table are wired up in S0.0.
 
 After every commit, schema change, decision, or config change — save immediately. Compaction eats unsaved state.
 
