@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+# Smart AI TD Operations — pre-push gate.
+# Architecture §17.7: remote sync, lint on changed files, unit tests, full build.
+
+set -e
+
+echo "[pre-push] fetching origin..."
+git fetch origin main --quiet
+
+LOCAL_HEAD="$(git rev-parse HEAD)"
+REMOTE_HEAD="$(git rev-parse origin/main 2>/dev/null || echo '')"
+MERGE_BASE="$(git merge-base "$LOCAL_HEAD" "$REMOTE_HEAD" 2>/dev/null || echo '')"
+
+if [ -n "$REMOTE_HEAD" ] && [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$REMOTE_HEAD" ]; then
+  echo "[pre-push] ERROR: origin/main has commits you don't have. Pull first."
+  exit 1
+fi
+
+echo "[pre-push] running assert:entity-table-sync..."
+npm run --silent assert:entity-table-sync
+
+echo "[pre-push] running unit tests..."
+npm run --silent test:unit
+
+echo "[pre-push] running build..."
+npm run --silent build
+
+echo "[pre-push] OK."

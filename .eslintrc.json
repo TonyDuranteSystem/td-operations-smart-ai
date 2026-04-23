@@ -1,0 +1,46 @@
+{
+  "extends": ["next/core-web-vitals", "next/typescript"],
+  "rules": {
+    "no-debugger": "error",
+    "no-unreachable": "error",
+    "no-self-compare": "error",
+    "no-constant-binary-expression": "error",
+    "eqeqeq": ["error", "always"],
+    "no-var": "error",
+    "no-console": ["warn", { "allow": ["warn", "error"] }],
+    "prefer-const": "warn",
+    "no-duplicate-imports": "warn",
+    "@typescript-eslint/no-unused-vars": [
+      "warn",
+      { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }
+    ],
+    "no-restricted-imports": [
+      "error",
+      {
+        "paths": [
+          {
+            "name": "inngest",
+            "message": "Import from '@/lib/workflows/engine' instead. Only 'lib/workflows/inngest-client.ts' may import from 'inngest' directly (architecture §17.4)."
+          }
+        ]
+      }
+    ],
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "CallExpression[callee.object.name='supabaseAdmin'][callee.property.name='from'][arguments.0.value=/^(events|outbox)$/]",
+        "message": "Direct writes to events/outbox are forbidden. Use withEmit() from '@/lib/events/emit' (architecture §5.4)."
+      }
+    ]
+  },
+  "overrides": [
+    {
+      "files": ["lib/workflows/inngest-client.ts"],
+      "rules": { "no-restricted-imports": "off" }
+    },
+    {
+      "files": ["lib/events/emit.ts"],
+      "rules": { "no-restricted-syntax": "off" }
+    }
+  ]
+}
