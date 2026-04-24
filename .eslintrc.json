@@ -11,6 +11,7 @@
     "no-console": ["warn", { "allow": ["warn", "error"] }],
     "prefer-const": "warn",
     "no-duplicate-imports": "warn",
+    "no-template-curly-in-string": "warn",
     "@typescript-eslint/no-unused-vars": [
       "warn",
       { "argsIgnorePattern": "^_", "varsIgnorePattern": "^_" }
@@ -31,10 +32,18 @@
       {
         "selector": "CallExpression[callee.object.name='supabaseAdmin'][callee.property.name='from'][arguments.0.value=/^(events|outbox)$/]",
         "message": "Direct writes to events/outbox are forbidden. Use withEmit() from '@/lib/events/emit' (architecture §5.4)."
+      },
+      {
+        "selector": "TSAsExpression[typeAnnotation.typeName.name='SupabaseClient']",
+        "message": "Do not cast to SupabaseClient; import the typed client from @/lib/supabase-admin."
       }
     ]
   },
   "overrides": [
+    {
+      "files": ["lib/supabase-admin.ts"],
+      "rules": { "no-restricted-syntax": "off" }
+    },
     {
       "files": ["lib/workflows/inngest-client.ts"],
       "rules": { "no-restricted-imports": "off" }

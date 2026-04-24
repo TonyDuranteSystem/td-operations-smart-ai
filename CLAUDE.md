@@ -27,9 +27,16 @@ Before any work in this repo, read in this order:
 Only rules that are universally true, not v1-scar-specific, are carried forward:
 
 - **R070** — Run `git pull origin main` BEFORE any work, every session. Multi-machine setup is real even on this greenfield (MacBook is lead; other machines may eventually contribute).
-- **R091** — Never create README.md or documentation files unless explicitly requested by Antonio.
+- **R091** — Never create README.md or documentation files unless Antonio explicitly requests them. Architecture lives in `docs/architecture.md` and Smart AI Supabase sysdocs.
 - **R093** — **NO ASSUMPTIONS. EVER.** Every column name, schema, enum, file path, function signature, API behavior, workflow semantic, or client state must be verified by a fresh tool call in the current session before use. "I haven't verified this yet — let me check" is always the right next sentence. Antonio's words: *"WITH YOUR ASSUMPTIONS WE RISK TO RUIN THE SYSTEM."*
 - **R101** — **DEVIL'S ADVOCATE MANDATORY.** Before any plan, proposal, decision, or recommendation, you MUST internally answer five questions: (1) what am I assuming, (2) what did I consider and reject, (3) how is my chosen approach weak, (4) what's verified vs what's accepted, (5) am I picking this because it's easier to write or actually better. If you cannot answer honestly, do not reply yet — investigate more. Antonio's words (2026-04-21): *"you don't have to assume or look for shortcut or be lazy. You must do always the devil's advocate of everything."* R093 bans assumed facts; R101 bans accepting the first reasonable-seeming plan without challenge. Full banner in v1 CLAUDE.md § Verification Protocol. Enforcement tool (`plan_challenge`) in progress as dev_task.
+
+Additional rules ported from v1 guardrails (Tier 1, 2026-04-23):
+
+- **R016** — All URLs, tokens, and slugs must be in English. No special characters in URL components.
+- **R086** — Write unit tests for every new function in `lib/`. The pre-push hook blocks push if `npm run test:unit` fails.
+- **R089** — All automation via Supabase Edge Functions, Inngest, or Vercel crons. Never Make, Zapier, n8n, or any other third-party automation platform.
+- **R090** — Never commit `.env.local`, `.env`, or any credentials. Verify `.gitignore` excludes them before staging.
 
 New rules for Smart AI will emerge from the system's actual behavior as it is built. They are derived, not inherited.
 
@@ -43,6 +50,35 @@ Before designing any feature:
 - Missing preventions are design gates: the feature does not ship until the scar is closed.
 
 Runtime: the Ops Agent retrieves relevant scars into its context bundle before every proposal. If a proposed action matches a known failure pattern AND the prevention isn't satisfied in current state, the agent escalates regardless of confidence.
+
+## Multi-machine git safety
+
+MacBook is the lead machine. If iMac or Mac Mini join later, these rules apply to all of them.
+
+- **MM3** — NEVER use `git add -A` or `git add .`. Stage specific files by name only. These commands stage deletions of files that exist on remote but are missing locally — another machine's work gets silently destroyed on the next push.
+- **MM4** — NEVER run `git push --force`. If push is rejected non-fast-forward, use `git pull --rebase origin main`. If conflicts exist, STOP and report — do not auto-resolve. After resolution: `git rebase --continue` → `npm run build` → `git push`.
+- **MM6** — Protected files — do NOT modify without Antonio's explicit request. Another machine may have updated them intentionally. If `git status` shows any of these modified without your action, investigate before committing:
+    - `CLAUDE.md`
+    - `.husky/pre-commit`
+    - `.husky/pre-push`
+    - `.claude/settings.json`
+    - `.claude/hooks/*.sh`
+    - `middleware.ts`
+    - `lib/config.ts`
+    - `lib/supabase-admin.ts`
+- **MM7** — When `git push` fails non-fast-forward: run `git pull --rebase origin main`. If conflicts exist, STOP — do not auto-resolve. List conflicted files and ask Antonio which version to keep. After manual resolution: `git rebase --continue` → `npm run build` → `git push`.
+
+## Database discipline
+
+Smart AI has TWO Supabase projects — never confuse them.
+
+- **D-Sandbox-vs-Prod** — Two projects, both required targets for every migration:
+    - **Sandbox** (`tapbgvbglqacamhayfel`): Stage 0–1 development. Contains v1-clone data (seeded 2026-02-22) for S0.7 shadow mode, S0.8 panel verification, and S0.9 scar extraction. This is the dev/staging environment.
+    - **Production** (`wxzomfntgnkryyzytcir`): Created 2026-04-23. Clean slate — no data yet. First real Smart AI client lands here at cutover 2026-10-21.
+
+  Every schema migration MUST be applied to BOTH projects. Apply to sandbox first, verify, then apply to production. Runner: `npx tsx scripts/apply-migrations.ts --target=sandbox` and `--target=production`. The runner has 4 guards: (1) required `--target` flag, (2) migration must reference the target's ref, (3) migration must not contain any v1 ref, (4) migration must not reference the other Smart AI ref. Each Stage 0–1 migration applied twice rehearses the cutover promotion workflow.
+
+  NEVER apply a migration to production only, or skip sandbox verification.
 
 ## Isolation — HARD RULES
 

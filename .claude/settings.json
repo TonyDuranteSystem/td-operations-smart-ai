@@ -1,0 +1,85 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/verify-before-edit.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/checkpoint-counter.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/stop-check.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/assumption-check.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/stop-enforcement.sh",
+            "timeout": 5
+          },
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/r095-gate.sh",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/pre-compact-save.sh",
+            "timeout": 15
+          },
+          {
+            "type": "prompt",
+            "prompt": "CRITICAL: Context compaction is about to happen. The auto-save script just ran but it only saves a minimal checkpoint. You MUST NOW save DETAILED progress to Smart AI dev_task 2bc839aa-2e8e-4841-85ff-8a3f304a68c5 on tapbgvbglqacamhayfel via Management API curl (POST https://api.supabase.com/v1/projects/tapbgvbglqacamhayfel/database/query, Bearer sbp_8d4b41dca5af0e06522b078963c9e621cfe68466). Save: (1) EVERY file changed, (2) EVERY commit hash, (3) EVERY DB change made, (4) exact state of in-progress work, (5) what is PENDING with specific details. NEVER use v1 MCP tools (session_checkpoint, execute_sql, sysdoc_*) for Smart AI work — those go to v1 prod. This is your LAST CHANCE — after compaction you will NOT remember any of this.",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/session-git-pull.sh",
+            "timeout": 30
+          },
+          {
+            "type": "prompt",
+            "prompt": "Session starting on Smart AI TD Operations. MANDATORY FIRST STEPS — do NOT use v1 MCP tools (sysdoc_read, dev_task_list, session_checkpoint) — Smart AI MCP not yet built. Use curl + Management API only (POST https://api.supabase.com/v1/projects/tapbgvbglqacamhayfel/database/query, Bearer sbp_8d4b41dca5af0e06522b078963c9e621cfe68466): (1) SELECT content FROM system_docs WHERE slug = 'smart-ai-td-ops-architecture' — read the architecture sysdoc, then run: touch /tmp/claude-smart-ai-context-loaded (2) SELECT content FROM system_docs WHERE slug = 'smart-ai-td-ops-stage-0-worklist' — read the stage-0 worklist. (3) SELECT id, title, status, priority, progress_log, updated_at FROM dev_tasks WHERE id = '2bc839aa-2e8e-4841-85ff-8a3f304a68c5' — read the Smart AI dev_task progress log. (4) Acknowledge git pull result above — if it pulled new commits, state what changed. Present: 'Last completed' + 'Pending' + 'Next steps' (from progress_log PENDING entries). Then ask 'What do we work on?'",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

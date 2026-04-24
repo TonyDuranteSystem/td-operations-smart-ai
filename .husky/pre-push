@@ -16,6 +16,24 @@ if [ -n "$REMOTE_HEAD" ] && [ -n "$MERGE_BASE" ] && [ "$MERGE_BASE" != "$REMOTE_
   exit 1
 fi
 
+# U3 domain grep deferred until Smart AI client-facing domains are finalized.
+
+echo "[pre-push] absolute path scan in .claude/hooks/..."
+if grep -rn "/Users/" .claude/hooks/ 2>/dev/null; then
+  echo "[pre-push] ERROR: absolute /Users/ paths found in .claude/hooks/ — not portable across machines."
+  exit 1
+fi
+
+echo "[pre-push] ESLint diff vs origin/main..."
+git fetch origin main --quiet
+CHANGED=$(git diff --name-only origin/main...HEAD -- '*.ts' '*.tsx' 2>/dev/null | grep -v '^\.next/' | grep -v '^next-env.d.ts$' || true)
+if [ -n "$CHANGED" ]; then
+  echo "$CHANGED" | xargs npx eslint --max-warnings 0 || {
+    echo "[pre-push] ERROR: ESLint failed on changed files."
+    exit 1
+  }
+fi
+
 echo "[pre-push] running assert:entity-table-sync..."
 npm run --silent assert:entity-table-sync
 
