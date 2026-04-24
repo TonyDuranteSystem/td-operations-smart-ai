@@ -33,12 +33,12 @@ const PANEL_SQL = `
       -- "exception" heuristic: active account with no paid payment in last 12m
       EXISTS (
         SELECT 1 FROM payments p
-        WHERE p.account_id = a.id AND p.status = 'paid'
+        WHERE p.account_id = a.id AND p.status = 'Paid'
       ) AS has_paid_payment,
       ROW_NUMBER() OVER (
         PARTITION BY a.entity_type, a.status,
           CASE WHEN EXISTS (
-            SELECT 1 FROM payments p WHERE p.account_id = a.id AND p.status = 'paid'
+            SELECT 1 FROM payments p WHERE p.account_id = a.id AND p.status = 'Paid'
           ) THEN 'paid' ELSE 'unpaid' END
         ORDER BY a.created_at DESC
       ) AS rn
@@ -53,16 +53,20 @@ const PANEL_SQL = `
   LIMIT 30
 `;
 
-async function loadClient(pool: pg.Pool, accountId: string): Promise<SandboxClient> {
-  const [accountRes, paymentsRes, membersRes, oaRes] = await Promise.all([
+async function loadClient(pool: pg.Pool, accountId: string): Promise<SandboxClient & { primary_contact_id: string | null }> {
+  const [accountRes, paymentsRes, membersRes, oaRes, contactRes] = await Promise.all([
     pool.query('SELECT * FROM accounts WHERE id = $1', [accountId]),
     pool.query(
-      "SELECT * FROM payments WHERE account_id = $1 AND status = 'paid' ORDER BY paid_date ASC LIMIT 5",
+      "SELECT * FROM payments WHERE account_id = $1 AND status = 'Paid' ORDER BY paid_date ASC LIMIT 5",
       [accountId]
     ),
     pool.query('SELECT * FROM account_contacts WHERE account_id = $1', [accountId]),
     pool.query(
       "SELECT COUNT(*) as n FROM oa_agreements WHERE account_id = $1 AND status = 'signed'",
+      [accountId]
+    ),
+    pool.query(
+      'SELECT contact_id FROM account_contacts WHERE account_id = $1 AND is_primary = true LIMIT 1',
       [accountId]
     ),
   ]);
@@ -73,6 +77,7 @@ async function loadClient(pool: pg.Pool, accountId: string): Promise<SandboxClie
     members: membersRes.rows,
     oa_signed: parseInt(String(oaRes.rows[0]?.n ?? '0'), 10) > 0,
     formation_completed_at: null,
+    primary_contact_id: (contactRes.rows[0]?.contact_id as string) ?? null,
   };
 }
 
@@ -91,17 +96,28 @@ function buildV1StatusReport(client: SandboxClient): Record<string, unknown> {
   };
 }
 
-function diffCategory(v1: Record<string, unknown>, report: StatusReport): string {
+/**
+ * Maps solver output vs v1 state to an allowed diff_category triage value.
+ * analysis_tag (stored in diff_detail) gives the raw classification before triage.
+ *
+ * Allowed: 'spec_bug' | 'import_bug' | 'v1_data_issue' | 'expected'
+ */
+function diffCategory(
+  v1: Record<string, unknown>,
+  report: StatusReport
+): { category: string; analysis_tag: string } {
   const allSatisfied = report.requirements.every(
     (r) => r.status === 'satisfied' || r.status === 'satisfied_by_exception'
   );
   const v1Active = String(v1['status']).toLowerCase() === 'active';
 
-  if (allSatisfied && v1Active) return 'match_complete';
-  if (!allSatisfied && !v1Active) return 'match_incomplete';
-  if (allSatisfied && !v1Active) return 'solver_over_satisfied';
-  if (!allSatisfied && v1Active) return 'solver_under_satisfied';
-  return 'unknown';
+  if (allSatisfied && v1Active) return { category: 'expected', analysis_tag: 'match_complete' };
+  if (!allSatisfied && !v1Active) return { category: 'expected', analysis_tag: 'match_incomplete' };
+  // Solver says complete but v1 shows non-active — data mismatch
+  if (allSatisfied && !v1Active) return { category: 'v1_data_issue', analysis_tag: 'solver_over_satisfied' };
+  // Solver says incomplete but v1 shows active — spec is missing something we can infer
+  if (!allSatisfied && v1Active) return { category: 'spec_bug', analysis_tag: 'solver_under_satisfied' };
+  return { category: 'spec_bug', analysis_tag: 'unknown' };
 }
 
 async function main() {
@@ -142,10 +158,10 @@ async function main() {
         [
           accountId,
           null,
-          'no_spec',
+          'expected',
           JSON.stringify({ entity_type: entityType, status: row.status }),
           null,
-          JSON.stringify({ reason: 'No Smart AI spec for MMLLC yet — S0.4 only seeded smllc_formation' }),
+          JSON.stringify({ analysis_tag: 'no_spec', reason: 'No Smart AI spec for MMLLC yet — S0.4 only seeded smllc_formation' }),
           `s0.8-panel-${now.slice(0, 10)}`,
         ]
       );
@@ -156,9 +172,37 @@ async function main() {
     try {
       const client = await loadClient(pool, accountId);
       const ctx = buildContext(client, now);
+      // Resolve contact_id — use primary contact from account_contacts, or stub one in contacts
+      let contactId = client.primary_contact_id;
+      if (!contactId) {
+        // No linked contact — insert a stub contact so the engagement FK is satisfied
+        const stubName = String(client.account['company_name'] ?? 'Unknown') + ' (shadow stub)';
+        const stubRes = await pool.query(
+          `INSERT INTO contacts (full_name) VALUES ($1) RETURNING id`,
+          [stubName]
+        );
+        contactId = stubRes.rows[0].id as string;
+      }
+
+      // Insert synthetic engagement so shadow_diffs FK is satisfied
+      await pool.query(
+        `INSERT INTO engagements (id, account_id, contact_id, contract_type, spec_id, status, metadata)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (id) DO NOTHING`,
+        [
+          ctx.engagement.id,
+          accountId,
+          contactId,
+          'smllc_formation',
+          SPEC_ID,
+          ctx.engagement.status,
+          JSON.stringify(ctx.engagement.metadata),
+        ]
+      );
+
       const report: StatusReport = evaluate(spec, ctx);
       const v1Status = buildV1StatusReport(client);
-      const category = diffCategory(v1Status, report);
+      const { category, analysis_tag } = diffCategory(v1Status, report);
 
       await pool.query(
         `INSERT INTO shadow_diffs
@@ -171,6 +215,7 @@ async function main() {
           JSON.stringify(v1Status),
           JSON.stringify(report),
           JSON.stringify({
+            analysis_tag,
             missing: report.requirements.filter((r) => r.status === 'missing').map((r) => r.key),
             blocked: report.requirements.filter((r) => r.status === 'blocked').map((r) => r.key),
             satisfied: report.requirements.filter(
@@ -182,10 +227,10 @@ async function main() {
         ]
       );
 
-      if (category.startsWith('match')) matched++;
+      if (analysis_tag.startsWith('match')) matched++;
       else diffed++;
 
-      console.log(`  ${category.padEnd(25)} ${row.company_name ?? accountId}`);
+      console.log(`  ${analysis_tag.padEnd(25)} [${category}] ${row.company_name ?? accountId}`);
     } catch (err) {
       console.error(`  ERROR ${accountId}:`, err instanceof Error ? err.message : err);
     }

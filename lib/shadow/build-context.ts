@@ -60,12 +60,23 @@ export function buildContext(client: SandboxClient, now: string): EvaluationCont
   const accountId = client.account['id'] as string;
   const engagementId = syntheticEngagementId(accountId);
 
+  const V1_STATUS_MAP: Record<string, string> = {
+    Active: 'active',
+    Cancelled: 'cancelled',
+    Closed: 'completed',
+    'Pending Formation': 'active',
+    Offboarding: 'on_hold',
+    Suspended: 'on_hold',
+  };
+  const v1AccountStatus = String(client.account['status'] ?? 'Active');
+  const engagementStatus = V1_STATUS_MAP[v1AccountStatus] ?? 'active';
+
   const engagement: EngagementView = {
     id: engagementId,
     account_id: accountId,
     contact_id: accountId, // v1 has no separate contact per engagement; use account as proxy
     contract_type: 'smllc_formation',
-    status: String(client.account['status'] ?? 'active'),
+    status: engagementStatus,
     metadata: {
       company_name: client.account['company_name'],
       state_of_formation: client.account['state_of_formation'],
