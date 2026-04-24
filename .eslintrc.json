@@ -45,6 +45,14 @@
       "rules": { "no-restricted-syntax": "off" }
     },
     {
+      "files": [
+        "lib/inngest/functions/outbox-drain.ts",
+        "app/api/cron/outbox-drain-fallback/route.ts",
+        "app/api/health/outbox-depth/route.ts"
+      ],
+      "rules": { "no-restricted-syntax": "off" }
+    },
+    {
       "files": ["lib/workflows/inngest-client.ts"],
       "rules": { "no-restricted-imports": "off" }
     },
