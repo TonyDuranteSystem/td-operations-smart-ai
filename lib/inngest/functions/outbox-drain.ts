@@ -50,13 +50,13 @@ export const outboxDrain = workflows.createFunction(
     id: 'outbox-drain',
     concurrency: { limit: 1 },
   },
-  // NOTE: architecture §5.2 specifies `'*/10 * * * * *'` (every 10 seconds).
-  // Inngest SDK standard cron is 5-field / 1-minute minimum. If Inngest
-  // rejects the 6-field form at app-sync time, lower to `'* * * * *'`
-  // (every minute) AND rely on the Realtime-triggered low-latency path
-  // described in architecture §5.2. The 10s figure is a target; the
-  // correctness guarantee comes from the outbox itself, not the cadence.
-  { cron: '*/10 * * * * *' },
+  // Architecture §5.2 target cadence was 10s (`'*/10 * * * * *'`), but
+  // Inngest Cloud only accepts 5-field cron (1-minute minimum) and rejected
+  // the 6-field form at app-sync time (2026-04-24). Dropped to 1-minute
+  // here; the low-latency path is the Realtime-triggered drain per §5.2.
+  // Correctness comes from the outbox itself (append-only + idempotent
+  // publish), not from the tick rate.
+  { cron: '* * * * *' },
   async ({ step }) => {
     const batch = await step.run('claim-batch', async () => {
       const { data, error } = await supabaseAdmin.rpc('claim_outbox_batch', {
