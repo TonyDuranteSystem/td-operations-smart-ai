@@ -19,6 +19,9 @@ export default function AdminLayout({ children }: { children: ReactNode }) {
             <Link href="/admin/events" className="text-zinc-600 hover:text-zinc-900">
               Events
             </Link>
+            <Link href="/admin/shadow-diffs" className="text-zinc-600 hover:text-zinc-900">
+              Shadow diffs
+            </Link>
           </nav>
         </div>
       </header>
